@@ -1,0 +1,15 @@
+/**
+ * todoforai-c-core/login/ — shared device login over Noise for C CLIs.
+ *
+ * Connects to the backend Noise TCP server, runs the device authorization
+ * flow (init → open browser → poll), and saves credentials to a config file.
+ *
+ * Config file: ~/.config/todoforai/credentials.json
+ *   {
+ *     "apiKey": "tfa_...",
+ *     "browserManagerNoiseAddr": "host:port",
+ *     "browserManagerNoisePublicKey": "hex",
+ *     "sandboxManagerNoiseAddr": "host:port",
+ *     "sandboxManagerNoisePublicKey": "hex"
+ *   }
+ */
