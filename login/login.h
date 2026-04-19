@@ -133,6 +133,15 @@ static void login_ensure_dir(const char *filepath) {
 
 // ── Minimal JSON helpers (no dependencies) ────────────────────────────────────
 
+// Detect "ok":false envelope tolerating whitespace around the colon.
+static int json_envelope_is_error(const char *json) {
+    const char *p = strstr(json, "\"ok\"");
+    if (!p) return 0;
+    p += 4;
+    while (*p == ' ' || *p == '\t' || *p == ':') p++;
+    return strncmp(p, "false", 5) == 0;
+}
+
 static const char *json_find_string(const char *json, const char *key, char *out, size_t cap) {
     char needle[128];
     snprintf(needle, sizeof(needle), "\"%s\"", key);
@@ -445,6 +454,16 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
     resp_str[copy_len] = '\0';
     free(init_resp);
 
+    // Reject error envelopes ({"ok":false,"error":{...}}) before parsing fields,
+    // otherwise json_find_string would pick up error.code as the device code.
+    if (json_envelope_is_error(resp_str)) {
+        char err_msg[256];
+        json_find_string(resp_str, "message", err_msg, sizeof(err_msg));
+        login_sock_close(session.fd);
+        fprintf(stderr, "error: init failed: %s\n", err_msg[0] ? err_msg : resp_str);
+        return -1;
+    }
+
     char device_code[256], auth_url[1024];
     json_find_string(resp_str, "code", device_code, sizeof(device_code));
     json_find_string(resp_str, "url", auth_url, sizeof(auth_url));
@@ -490,6 +509,14 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
         memcpy(resp_str, poll_resp, copy_len);
         resp_str[copy_len] = '\0';
         free(poll_resp);
+
+        // Bail out on error envelopes instead of silently spinning for 10 minutes.
+        if (json_envelope_is_error(resp_str)) {
+            char err_msg[256];
+            json_find_string(resp_str, "message", err_msg, sizeof(err_msg));
+            fprintf(stderr, "\033[31merror: poll failed: %s\033[0m\n", err_msg[0] ? err_msg : resp_str);
+            break;
+        }
 
         char status[32];
         json_find_string(resp_str, "status", status, sizeof(status));
