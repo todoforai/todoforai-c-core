@@ -16,6 +16,10 @@
 // Credential store — loaded from / saved to ~/.config/todoforai/credentials.json
 typedef struct {
     char api_key[256];
+    // Device credentials (used by the C bridge; other clients leave these empty).
+    char device_id[128];
+    char device_secret[128];
+    char device_name[128];
     char browser_manager_noise_addr[256];
     char browser_manager_noise_public_key[128];
     char sandbox_manager_noise_addr[256];
@@ -34,10 +38,12 @@ int login_config_path(char *buf, size_t cap);
 // Run the full device login flow over Noise.
 //   backend_addr: "host:port" of backend Noise server
 //   backend_pub:  32-byte hex public key of backend Noise server
-//   client_name:  e.g. "sandbox" or "browser"
+//   client_name:  e.g. "sandbox", "browser", or "bridge" (bridge mints a
+//                 Device credential; others mint an ApiKey)
+//   device_name:  optional label for the new device (bridge only, may be NULL)
 // On success, saves credentials and returns 0.
 int login_device_flow(const char *backend_addr, const char *backend_pub,
-                      const char *client_name);
+                      const char *client_name, const char *device_name);
 
 #endif // LOGIN_H
 
@@ -174,11 +180,15 @@ int login_load_credentials(login_credentials_t *creds) {
     fclose(f);
     buf[n] = '\0';
     json_find_string(buf, "apiKey", creds->api_key, sizeof(creds->api_key));
+    json_find_string(buf, "deviceId", creds->device_id, sizeof(creds->device_id));
+    json_find_string(buf, "deviceSecret", creds->device_secret, sizeof(creds->device_secret));
+    json_find_string(buf, "deviceName", creds->device_name, sizeof(creds->device_name));
     json_find_string(buf, "browserManagerNoiseAddr", creds->browser_manager_noise_addr, sizeof(creds->browser_manager_noise_addr));
     json_find_string(buf, "browserManagerNoisePublicKey", creds->browser_manager_noise_public_key, sizeof(creds->browser_manager_noise_public_key));
     json_find_string(buf, "sandboxManagerNoiseAddr", creds->sandbox_manager_noise_addr, sizeof(creds->sandbox_manager_noise_addr));
     json_find_string(buf, "sandboxManagerNoisePublicKey", creds->sandbox_manager_noise_public_key, sizeof(creds->sandbox_manager_noise_public_key));
-    return creds->api_key[0] ? 0 : -1;
+    // Success if we loaded any credential type.
+    return (creds->api_key[0] || creds->device_id[0]) ? 0 : -1;
 }
 
 // Write a JSON-escaped string value to file
@@ -197,6 +207,32 @@ static void json_write_escaped(FILE *f, const char *s) {
     fputc('"', f);
 }
 
+// Escape a string into a fixed buffer (bare value, no surrounding quotes).
+// Returns 0 on success, -1 if truncated.
+static int json_escape_buf(char *out, size_t cap, const char *s) {
+    size_t i = 0;
+    for (; *s; s++) {
+        const char *esc = NULL;
+        switch (*s) {
+            case '"':  esc = "\\\""; break;
+            case '\\': esc = "\\\\"; break;
+            case '\n': esc = "\\n";  break;
+            case '\r': esc = "\\r";  break;
+            case '\t': esc = "\\t";  break;
+        }
+        if (esc) {
+            if (i + 2 >= cap) return -1;
+            out[i++] = esc[0]; out[i++] = esc[1];
+        } else {
+            if (i + 1 >= cap) return -1;
+            out[i++] = *s;
+        }
+    }
+    if (i >= cap) return -1;
+    out[i] = '\0';
+    return 0;
+}
+
 static void json_write_field(FILE *f, const char *key, const char *val, int *first) {
     if (!val[0]) return;
     if (!*first) fputs(",\n", f);
@@ -212,6 +248,12 @@ int login_save_credentials(const login_credentials_t *creds) {
         memset(&merged, 0, sizeof(merged));
     if (creds->api_key[0])
         snprintf(merged.api_key, sizeof(merged.api_key), "%s", creds->api_key);
+    if (creds->device_id[0])
+        snprintf(merged.device_id, sizeof(merged.device_id), "%s", creds->device_id);
+    if (creds->device_secret[0])
+        snprintf(merged.device_secret, sizeof(merged.device_secret), "%s", creds->device_secret);
+    if (creds->device_name[0])
+        snprintf(merged.device_name, sizeof(merged.device_name), "%s", creds->device_name);
     if (creds->browser_manager_noise_addr[0])
         snprintf(merged.browser_manager_noise_addr, sizeof(merged.browser_manager_noise_addr), "%s", creds->browser_manager_noise_addr);
     if (creds->browser_manager_noise_public_key[0])
@@ -236,6 +278,9 @@ int login_save_credentials(const login_credentials_t *creds) {
     int first = 1;
     fputs("{\n", f);
     json_write_field(f, "apiKey", merged.api_key, &first);
+    json_write_field(f, "deviceId", merged.device_id, &first);
+    json_write_field(f, "deviceSecret", merged.device_secret, &first);
+    json_write_field(f, "deviceName", merged.device_name, &first);
     json_write_field(f, "browserManagerNoiseAddr", merged.browser_manager_noise_addr, &first);
     json_write_field(f, "browserManagerNoisePublicKey", merged.browser_manager_noise_public_key, &first);
     json_write_field(f, "sandboxManagerNoiseAddr", merged.sandbox_manager_noise_addr, &first);
@@ -408,7 +453,7 @@ static int login_noise_connect(login_session_t *s, const char *host, const char 
 // ── Device login flow ─────────────────────────────────────────────────────────
 
 int login_device_flow(const char *backend_addr, const char *backend_pub,
-                      const char *client_name) {
+                      const char *client_name, const char *device_name) {
     login_sock_init();
 
     uint8_t remote_pub[32];
@@ -440,9 +485,21 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
     login_hex_encode(id_hex, id_bytes, 4);
 
     char init_req[512];
-    snprintf(init_req, sizeof(init_req),
-        "{\"id\":\"%s\",\"type\":\"cli.login.init\",\"payload\":{\"clientName\":\"%s\"}}",
-        id_hex, client_name);
+    if (device_name && *device_name) {
+        char name_esc[256];
+        if (json_escape_buf(name_esc, sizeof(name_esc), device_name) != 0) {
+            login_sock_close(session.fd);
+            fprintf(stderr, "error: device name too long\n");
+            return -1;
+        }
+        snprintf(init_req, sizeof(init_req),
+            "{\"id\":\"%s\",\"type\":\"cli.login.init\",\"payload\":{\"clientName\":\"%s\",\"deviceName\":\"%s\"}}",
+            id_hex, client_name, name_esc);
+    } else {
+        snprintf(init_req, sizeof(init_req),
+            "{\"id\":\"%s\",\"type\":\"cli.login.init\",\"payload\":{\"clientName\":\"%s\"}}",
+            id_hex, client_name);
+    }
 
     uint8_t *init_resp;
     int init_resp_len = login_noise_rpc(session.fd, &session.transport, init_req, strlen(init_req), &init_resp);
@@ -525,13 +582,24 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
             login_credentials_t creds;
             memset(&creds, 0, sizeof(creds));
             json_find_string(resp_str, "apiKey", creds.api_key, sizeof(creds.api_key));
+            // Device credentials are nested under "device":{...} — scan to that
+            // object so json_find_string doesn't collide with envelope fields.
+            const char *dev = strstr(resp_str, "\"device\"");
+            if (dev) {
+                dev = strchr(dev, '{');
+                if (dev) {
+                    json_find_string(dev, "id", creds.device_id, sizeof(creds.device_id));
+                    json_find_string(dev, "secret", creds.device_secret, sizeof(creds.device_secret));
+                    json_find_string(dev, "name", creds.device_name, sizeof(creds.device_name));
+                }
+            }
             json_find_string(resp_str, "browserManagerNoiseAddr", creds.browser_manager_noise_addr, sizeof(creds.browser_manager_noise_addr));
             json_find_string(resp_str, "browserManagerNoisePublicKey", creds.browser_manager_noise_public_key, sizeof(creds.browser_manager_noise_public_key));
             json_find_string(resp_str, "sandboxManagerNoiseAddr", creds.sandbox_manager_noise_addr, sizeof(creds.sandbox_manager_noise_addr));
             json_find_string(resp_str, "sandboxManagerNoisePublicKey", creds.sandbox_manager_noise_public_key, sizeof(creds.sandbox_manager_noise_public_key));
 
-            if (!creds.api_key[0]) {
-                fprintf(stderr, "error: approved but no API key in response\n");
+            if (!creds.api_key[0] && !creds.device_id[0]) {
+                fprintf(stderr, "error: approved but no credentials in response\n");
                 break;
             }
 
