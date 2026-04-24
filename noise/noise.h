@@ -1,4 +1,4 @@
-// Noise_NX_25519_ChaChaPoly_BLAKE2s — C implementation
+// Noise_NX_25519_ChaChaPoly_BLAKE2b — C implementation
 // Minimal initiator-side transport for bootstrap/client CLIs.
 
 #ifndef NOISE_H
@@ -7,7 +7,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define NOISE_TAG_LEN 16
+#define NOISE_TAG_LEN  16
+#define NOISE_HASH_LEN 64   // BLAKE2b-512 output size
+#define NOISE_KEY_LEN  32   // ChaCha20-Poly1305 key size
 
 typedef struct {
     uint8_t public_key[32];
@@ -15,14 +17,14 @@ typedef struct {
 } noise_keypair_t;
 
 typedef struct {
-    uint8_t key[32];
+    uint8_t key[NOISE_KEY_LEN];
     int     has_key;
     uint64_t nonce;
 } noise_cipher_state_t;
 
 typedef struct {
-    uint8_t ck[32];
-    uint8_t h[32];
+    uint8_t ck[NOISE_HASH_LEN];
+    uint8_t h[NOISE_HASH_LEN];
     noise_cipher_state_t cipher;
 } noise_symmetric_state_t;
 
@@ -69,6 +71,17 @@ int noise_transport_read(noise_transport_t *t,
 
 // Generate keypair from secret key (derive public via X25519)
 void noise_keypair_from_secret(noise_keypair_t *kp, const uint8_t secret[32]);
+
+#ifdef NOISE_TEST_HOOKS
+// TEST-ONLY: override the ephemeral that noise_handshake_write will use.
+// Must be called after noise_handshake_init, before noise_handshake_write.
+void noise_handshake_set_fixed_ephemeral(noise_handshake_t *hs, const uint8_t priv[32]);
+
+// TEST-ONLY: snapshot current SymmetricState (h, ck, k, has_key).
+void noise_handshake_debug_state(const noise_handshake_t *hs,
+                                 uint8_t h_out[NOISE_HASH_LEN], uint8_t ck_out[NOISE_HASH_LEN],
+                                 uint8_t k_out[NOISE_KEY_LEN], int *has_key_out);
+#endif
 
 // Platform-native secure random. Returns 0 on success, -1 on failure.
 int noise_random(uint8_t *buf, size_t len);
