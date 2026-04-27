@@ -20,10 +20,11 @@ typedef struct {
     char device_id[128];
     char device_secret[128];
     char device_name[128];
-    char browser_manager_noise_addr[256];
-    char browser_manager_noise_public_key[128];
-    char sandbox_manager_noise_addr[256];
-    char sandbox_manager_noise_public_key[128];
+    // Friendly identity from the login response — for `whoami` output.
+    // Never used for auth; never includes secrets.
+    char user_id[64];
+    char user_email[256];
+    char user_name[128];
 } login_credentials_t;
 
 // Load credentials from config file. Returns 0 on success, -1 if not found.
@@ -45,6 +46,12 @@ int login_config_path(char *buf, size_t cap);
 int login_device_flow(const char *backend_addr, const char *backend_pub,
                       const char *client_name, const char *device_name);
 
+// Print "whoami" output to stdout in a unified format. Reads creds from disk.
+//   client_name: "bridge" / "browser" / "sandbox" — affects the not-logged-in
+//                hint message. Never echoes secrets.
+// Returns 0 if logged in, 1 if not.
+int login_print_whoami(const char *client_name);
+
 #endif // LOGIN_H
 
 
@@ -61,6 +68,7 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <shlobj.h>
+#include <shellapi.h>
 #include <direct.h>
 typedef SOCKET sock_t;
 #define SOCK_INVALID INVALID_SOCKET
@@ -183,10 +191,9 @@ int login_load_credentials(login_credentials_t *creds) {
     json_find_string(buf, "deviceId", creds->device_id, sizeof(creds->device_id));
     json_find_string(buf, "deviceSecret", creds->device_secret, sizeof(creds->device_secret));
     json_find_string(buf, "deviceName", creds->device_name, sizeof(creds->device_name));
-    json_find_string(buf, "browserManagerNoiseAddr", creds->browser_manager_noise_addr, sizeof(creds->browser_manager_noise_addr));
-    json_find_string(buf, "browserManagerNoisePublicKey", creds->browser_manager_noise_public_key, sizeof(creds->browser_manager_noise_public_key));
-    json_find_string(buf, "sandboxManagerNoiseAddr", creds->sandbox_manager_noise_addr, sizeof(creds->sandbox_manager_noise_addr));
-    json_find_string(buf, "sandboxManagerNoisePublicKey", creds->sandbox_manager_noise_public_key, sizeof(creds->sandbox_manager_noise_public_key));
+    json_find_string(buf, "userId", creds->user_id, sizeof(creds->user_id));
+    json_find_string(buf, "userEmail", creds->user_email, sizeof(creds->user_email));
+    json_find_string(buf, "userName", creds->user_name, sizeof(creds->user_name));
     // Success if we loaded any credential type.
     return (creds->api_key[0] || creds->device_id[0]) ? 0 : -1;
 }
@@ -254,14 +261,12 @@ int login_save_credentials(const login_credentials_t *creds) {
         snprintf(merged.device_secret, sizeof(merged.device_secret), "%s", creds->device_secret);
     if (creds->device_name[0])
         snprintf(merged.device_name, sizeof(merged.device_name), "%s", creds->device_name);
-    if (creds->browser_manager_noise_addr[0])
-        snprintf(merged.browser_manager_noise_addr, sizeof(merged.browser_manager_noise_addr), "%s", creds->browser_manager_noise_addr);
-    if (creds->browser_manager_noise_public_key[0])
-        snprintf(merged.browser_manager_noise_public_key, sizeof(merged.browser_manager_noise_public_key), "%s", creds->browser_manager_noise_public_key);
-    if (creds->sandbox_manager_noise_addr[0])
-        snprintf(merged.sandbox_manager_noise_addr, sizeof(merged.sandbox_manager_noise_addr), "%s", creds->sandbox_manager_noise_addr);
-    if (creds->sandbox_manager_noise_public_key[0])
-        snprintf(merged.sandbox_manager_noise_public_key, sizeof(merged.sandbox_manager_noise_public_key), "%s", creds->sandbox_manager_noise_public_key);
+    if (creds->user_id[0])
+        snprintf(merged.user_id, sizeof(merged.user_id), "%s", creds->user_id);
+    if (creds->user_email[0])
+        snprintf(merged.user_email, sizeof(merged.user_email), "%s", creds->user_email);
+    if (creds->user_name[0])
+        snprintf(merged.user_name, sizeof(merged.user_name), "%s", creds->user_name);
 
     char path[1024];
     if (login_config_path(path, sizeof(path)) < 0) return -1;
@@ -281,13 +286,46 @@ int login_save_credentials(const login_credentials_t *creds) {
     json_write_field(f, "deviceId", merged.device_id, &first);
     json_write_field(f, "deviceSecret", merged.device_secret, &first);
     json_write_field(f, "deviceName", merged.device_name, &first);
-    json_write_field(f, "browserManagerNoiseAddr", merged.browser_manager_noise_addr, &first);
-    json_write_field(f, "browserManagerNoisePublicKey", merged.browser_manager_noise_public_key, &first);
-    json_write_field(f, "sandboxManagerNoiseAddr", merged.sandbox_manager_noise_addr, &first);
-    json_write_field(f, "sandboxManagerNoisePublicKey", merged.sandbox_manager_noise_public_key, &first);
+    json_write_field(f, "userId", merged.user_id, &first);
+    json_write_field(f, "userEmail", merged.user_email, &first);
+    json_write_field(f, "userName", merged.user_name, &first);
     fputs("\n}\n", f);
     fclose(f);
     if (rename(tmp_path, path) != 0) { remove(tmp_path); return -1; }
+    return 0;
+}
+
+// ── whoami ────────────────────────────────────────────────────────────────────
+
+int login_print_whoami(const char *client_name) {
+    login_credentials_t creds;
+    memset(&creds, 0, sizeof(creds));
+    int loaded = login_load_credentials(&creds);
+    int has_device = creds.device_id[0] && creds.device_secret[0];
+    int has_apikey = creds.api_key[0] != '\0';
+    if (loaded < 0 || (!has_device && !has_apikey)) {
+        fprintf(stderr, "Not logged in. Run `%s login` first.\n",
+                client_name ? client_name : "cli");
+        return 1;
+    }
+    if (creds.user_email[0] || creds.user_name[0]) {
+        printf("User:   %s%s%s%s\n",
+               creds.user_name[0] ? creds.user_name : "",
+               creds.user_name[0] && creds.user_email[0] ? " <" : "",
+               creds.user_email[0] ? creds.user_email : "",
+               creds.user_name[0] && creds.user_email[0] ? ">" : "");
+    } else {
+        printf("User:   (unknown — log in again to refresh identity)\n");
+    }
+    if (has_device) {
+        printf("Device: %s (id: %s)\n",
+               creds.device_name[0] ? creds.device_name : "(unnamed)",
+               creds.device_id);
+    } else {
+        printf("Auth:   API key\n");
+    }
+    char path[1024];
+    if (login_config_path(path, sizeof(path)) == 0) printf("Config: %s\n", path);
     return 0;
 }
 
@@ -593,10 +631,16 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
                     json_find_string(dev, "name", creds.device_name, sizeof(creds.device_name));
                 }
             }
-            json_find_string(resp_str, "browserManagerNoiseAddr", creds.browser_manager_noise_addr, sizeof(creds.browser_manager_noise_addr));
-            json_find_string(resp_str, "browserManagerNoisePublicKey", creds.browser_manager_noise_public_key, sizeof(creds.browser_manager_noise_public_key));
-            json_find_string(resp_str, "sandboxManagerNoiseAddr", creds.sandbox_manager_noise_addr, sizeof(creds.sandbox_manager_noise_addr));
-            json_find_string(resp_str, "sandboxManagerNoisePublicKey", creds.sandbox_manager_noise_public_key, sizeof(creds.sandbox_manager_noise_public_key));
+            // Friendly identity, nested under "user":{...} — for `whoami` only.
+            const char *usr = strstr(resp_str, "\"user\"");
+            if (usr) {
+                usr = strchr(usr, '{');
+                if (usr) {
+                    json_find_string(usr, "id",    creds.user_id,    sizeof(creds.user_id));
+                    json_find_string(usr, "email", creds.user_email, sizeof(creds.user_email));
+                    json_find_string(usr, "name",  creds.user_name,  sizeof(creds.user_name));
+                }
+            }
 
             if (!creds.api_key[0] && !creds.device_id[0]) {
                 fprintf(stderr, "error: approved but no credentials in response\n");
