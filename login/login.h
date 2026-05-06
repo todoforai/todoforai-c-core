@@ -13,6 +13,13 @@
 
 #define LOGIN_CONFIG_MAX 4096
 
+// Production backend host. Single source of truth: bridge daemon, login,
+// enroll, browser, sandbox all default to this when nothing else is set.
+// Per-protocol ports are derived from the host (4100 Noise / 80 HTTP for
+// prod; 14100 / 4000 for localhost dev).
+#define LOGIN_DEFAULT_BACKEND_HOST "api.todofor.ai"
+#define LOGIN_DEFAULT_NOISE_PORT   "4100"
+
 // Credential store — loaded from / saved to ~/.config/todoforai/credentials.json
 typedef struct {
     char api_key[256];
@@ -700,7 +707,7 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
                 char host_only[256];
                 memcpy(host_only, backend_addr, bhlen);
                 host_only[bhlen] = '\0';
-                const char *to_save = strcmp(host_only, "api.todofor.ai") == 0 ? NULL : host_only;
+                const char *to_save = strcmp(host_only, LOGIN_DEFAULT_BACKEND_HOST) == 0 ? NULL : host_only;
                 login_set_backend_host(to_save);
             }
 
