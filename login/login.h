@@ -25,6 +25,10 @@ typedef struct {
     char user_id[64];
     char user_email[256];
     char user_name[128];
+    // Backend host the credentials were minted against (e.g. "api.todofor.ai"
+    // or "127.0.0.1"). Lets the daemon connect to the same backend without
+    // re-passing --host. Port is derived per-protocol (host-based default).
+    char backend_host[256];
 } login_credentials_t;
 
 // Load credentials from config file. Returns 0 on success, -1 if not found.
@@ -194,6 +198,7 @@ int login_load_credentials(login_credentials_t *creds) {
     json_find_string(buf, "userId", creds->user_id, sizeof(creds->user_id));
     json_find_string(buf, "userEmail", creds->user_email, sizeof(creds->user_email));
     json_find_string(buf, "userName", creds->user_name, sizeof(creds->user_name));
+    json_find_string(buf, "backendHost", creds->backend_host, sizeof(creds->backend_host));
     // Success if we loaded any credential type.
     return (creds->api_key[0] || creds->device_id[0]) ? 0 : -1;
 }
@@ -267,6 +272,8 @@ int login_save_credentials(const login_credentials_t *creds) {
         snprintf(merged.user_email, sizeof(merged.user_email), "%s", creds->user_email);
     if (creds->user_name[0])
         snprintf(merged.user_name, sizeof(merged.user_name), "%s", creds->user_name);
+    if (creds->backend_host[0])
+        snprintf(merged.backend_host, sizeof(merged.backend_host), "%s", creds->backend_host);
 
     char path[1024];
     if (login_config_path(path, sizeof(path)) < 0) return -1;
@@ -289,6 +296,7 @@ int login_save_credentials(const login_credentials_t *creds) {
     json_write_field(f, "userId", merged.user_id, &first);
     json_write_field(f, "userEmail", merged.user_email, &first);
     json_write_field(f, "userName", merged.user_name, &first);
+    json_write_field(f, "backendHost", merged.backend_host, &first);
     fputs("\n}\n", f);
     fclose(f);
     if (rename(tmp_path, path) != 0) { remove(tmp_path); return -1; }
@@ -667,6 +675,16 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
             if (!creds.api_key[0] && !creds.device_id[0]) {
                 fprintf(stderr, "error: approved but no credentials in response\n");
                 break;
+            }
+
+            // Remember which backend these creds came from, so the daemon
+            // can default to it without re-passing --host.
+            {
+                const char *bcolon = strrchr(backend_addr, ':');
+                size_t bhlen = bcolon ? (size_t)(bcolon - backend_addr) : strlen(backend_addr);
+                if (bhlen >= sizeof(creds.backend_host)) bhlen = sizeof(creds.backend_host) - 1;
+                memcpy(creds.backend_host, backend_addr, bhlen);
+                creds.backend_host[bhlen] = '\0';
             }
 
             if (login_save_credentials(&creds) < 0) {
