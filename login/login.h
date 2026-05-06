@@ -37,6 +37,10 @@ int login_load_credentials(login_credentials_t *creds);
 // Save credentials to config file. Returns 0 on success, -1 on error.
 int login_save_credentials(const login_credentials_t *creds);
 
+// Set or clear the persisted backend host (loads existing creds, overwrites
+// just backend_host, saves). Pass NULL or "" to clear.
+int login_set_backend_host(const char *host);
+
 // Get config file path. Writes to buf, returns 0 on success.
 int login_config_path(char *buf, size_t cap);
 
@@ -272,9 +276,8 @@ int login_save_credentials(const login_credentials_t *creds) {
         snprintf(merged.user_email, sizeof(merged.user_email), "%s", creds->user_email);
     if (creds->user_name[0])
         snprintf(merged.user_name, sizeof(merged.user_name), "%s", creds->user_name);
-    // backend_host: always overwrite (empty means "default/prod"), so logging
-    // into prod after dev clears any stale dev host instead of merging it.
-    snprintf(merged.backend_host, sizeof(merged.backend_host), "%s", creds->backend_host);
+    if (creds->backend_host[0])
+        snprintf(merged.backend_host, sizeof(merged.backend_host), "%s", creds->backend_host);
 
     char path[1024];
     if (login_config_path(path, sizeof(path)) < 0) return -1;
@@ -298,6 +301,41 @@ int login_save_credentials(const login_credentials_t *creds) {
     json_write_field(f, "userEmail", merged.user_email, &first);
     json_write_field(f, "userName", merged.user_name, &first);
     json_write_field(f, "backendHost", merged.backend_host, &first);
+    fputs("\n}\n", f);
+    fclose(f);
+    if (rename(tmp_path, path) != 0) { remove(tmp_path); return -1; }
+    return 0;
+}
+
+// Set or clear backend_host without merge ambiguity. Empty/NULL clears it.
+int login_set_backend_host(const char *host) {
+    login_credentials_t creds;
+    if (login_load_credentials(&creds) < 0) memset(&creds, 0, sizeof(creds));
+    if (host && host[0])
+        snprintf(creds.backend_host, sizeof(creds.backend_host), "%s", host);
+    else
+        creds.backend_host[0] = '\0';
+    // Re-write the file directly (bypass merge, which would re-fill from disk).
+    char path[1024];
+    if (login_config_path(path, sizeof(path)) < 0) return -1;
+    login_ensure_dir(path);
+    char tmp_path[1040];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    FILE *f = fopen(tmp_path, "w");
+    if (!f) return -1;
+#ifndef _WIN32
+    chmod(tmp_path, 0600);
+#endif
+    int first = 1;
+    fputs("{\n", f);
+    json_write_field(f, "apiKey", creds.api_key, &first);
+    json_write_field(f, "deviceId", creds.device_id, &first);
+    json_write_field(f, "deviceSecret", creds.device_secret, &first);
+    json_write_field(f, "deviceName", creds.device_name, &first);
+    json_write_field(f, "userId", creds.user_id, &first);
+    json_write_field(f, "userEmail", creds.user_email, &first);
+    json_write_field(f, "userName", creds.user_name, &first);
+    json_write_field(f, "backendHost", creds.backend_host, &first);
     fputs("\n}\n", f);
     fclose(f);
     if (rename(tmp_path, path) != 0) { remove(tmp_path); return -1; }
@@ -678,9 +716,13 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
                 break;
             }
 
-            // Remember which backend these creds came from, so the daemon
-            // can default to it without re-passing --host. Only persist when
-            // non-default — prod users' credentials.json stays clean.
+            if (login_save_credentials(&creds) < 0) {
+                fprintf(stderr, "error: failed to save credentials\n");
+                break;
+            }
+
+            // Persist backend host so daemons can default to it. Empty/prod
+            // clears any stale dev host from previous logins.
             {
                 const char *bcolon = strrchr(backend_addr, ':');
                 size_t bhlen = bcolon ? (size_t)(bcolon - backend_addr) : strlen(backend_addr);
@@ -688,14 +730,8 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
                 char host_only[256];
                 memcpy(host_only, backend_addr, bhlen);
                 host_only[bhlen] = '\0';
-                if (strcmp(host_only, "api.todofor.ai") != 0) {
-                    memcpy(creds.backend_host, host_only, bhlen + 1);
-                }
-            }
-
-            if (login_save_credentials(&creds) < 0) {
-                fprintf(stderr, "error: failed to save credentials\n");
-                break;
+                const char *to_save = strcmp(host_only, "api.todofor.ai") == 0 ? NULL : host_only;
+                login_set_backend_host(to_save);
             }
 
             char config_path[1024];
