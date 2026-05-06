@@ -462,6 +462,11 @@ typedef struct {
     noise_transport_t transport;
 } login_session_t;
 
+// Return codes:
+//    0 — success
+//   -1 — TCP connect failed (DNS, refused, host unreachable)
+//   -2 — Noise handshake failed (wrong --server-pubkey, server identity changed,
+//        or remote isn't a Noise endpoint at all — e.g. plain HTTP on the wrong port)
 static int login_noise_connect(login_session_t *s, const char *host, const char *port_str,
                                const uint8_t remote_pub[32]) {
     s->fd = login_tcp_connect(host, port_str);
@@ -472,19 +477,19 @@ static int login_noise_connect(login_session_t *s, const char *host, const char 
 
     uint8_t m1_buf[256];
     int m1_len = noise_handshake_write(&hs, (const uint8_t *)"", 0, m1_buf, sizeof(m1_buf));
-    if (m1_len < 0) { login_sock_close(s->fd); s->fd = SOCK_INVALID; return -1; }
-    if (login_write_frame(s->fd, m1_buf, (size_t)m1_len) < 0) { login_sock_close(s->fd); s->fd = SOCK_INVALID; return -1; }
+    if (m1_len < 0) { login_sock_close(s->fd); s->fd = SOCK_INVALID; return -2; }
+    if (login_write_frame(s->fd, m1_buf, (size_t)m1_len) < 0) { login_sock_close(s->fd); s->fd = SOCK_INVALID; return -2; }
 
     uint8_t *m2_data;
     size_t m2_len;
-    if (login_read_frame(s->fd, &m2_data, &m2_len) < 0) { login_sock_close(s->fd); s->fd = SOCK_INVALID; return -1; }
+    if (login_read_frame(s->fd, &m2_data, &m2_len) < 0) { login_sock_close(s->fd); s->fd = SOCK_INVALID; return -2; }
     uint8_t p2_buf[64];
     if (noise_handshake_read(&hs, m2_data, m2_len, p2_buf, sizeof(p2_buf)) < 0) {
-        free(m2_data); login_sock_close(s->fd); s->fd = SOCK_INVALID; return -1;
+        free(m2_data); login_sock_close(s->fd); s->fd = SOCK_INVALID; return -2;
     }
     free(m2_data);
 
-    if (noise_handshake_split(&hs, &s->transport) < 0) { login_sock_close(s->fd); s->fd = SOCK_INVALID; return -1; }
+    if (noise_handshake_split(&hs, &s->transport) < 0) { login_sock_close(s->fd); s->fd = SOCK_INVALID; return -2; }
     return 0;
 }
 
@@ -511,8 +516,25 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
 
     // Connect + handshake
     login_session_t session;
-    if (login_noise_connect(&session, host, port_str, remote_pub) < 0) {
-        fprintf(stderr, "error: cannot connect to %s\n", backend_addr);
+    int conn_rc = login_noise_connect(&session, host, port_str, remote_pub);
+    if (conn_rc == -1) {
+        fprintf(stderr,
+            "error: cannot reach %s (TCP connect failed).\n"
+            "  - Is the backend running and listening on this host:port?\n"
+            "  - Check firewall / network. Try: nc -zv %s %s\n",
+            backend_addr, host, port_str);
+        return -1;
+    }
+    if (conn_rc < 0) {
+        fprintf(stderr,
+            "error: connected to %s but Noise handshake failed.\n"
+            "  - Wrong --server-pubkey for this server (most common cause).\n"
+            "  - Server identity changed — check backend logs for\n"
+            "    '[noise] Server public key: <hex>' and pass it via\n"
+            "    --server-pubkey <hex> (or NOISE_BACKEND_PUBLIC_KEY).\n"
+            "  - --port should be the Noise-TCP RPC port (14100 dev, 4100 prod),\n"
+            "    NOT the HTTP/WS bridge port (4000 dev, 80/443 prod).\n",
+            backend_addr);
         return -1;
     }
 
