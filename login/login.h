@@ -272,8 +272,9 @@ int login_save_credentials(const login_credentials_t *creds) {
         snprintf(merged.user_email, sizeof(merged.user_email), "%s", creds->user_email);
     if (creds->user_name[0])
         snprintf(merged.user_name, sizeof(merged.user_name), "%s", creds->user_name);
-    if (creds->backend_host[0])
-        snprintf(merged.backend_host, sizeof(merged.backend_host), "%s", creds->backend_host);
+    // backend_host: always overwrite (empty means "default/prod"), so logging
+    // into prod after dev clears any stale dev host instead of merging it.
+    snprintf(merged.backend_host, sizeof(merged.backend_host), "%s", creds->backend_host);
 
     char path[1024];
     if (login_config_path(path, sizeof(path)) < 0) return -1;
@@ -678,13 +679,18 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
             }
 
             // Remember which backend these creds came from, so the daemon
-            // can default to it without re-passing --host.
+            // can default to it without re-passing --host. Only persist when
+            // non-default — prod users' credentials.json stays clean.
             {
                 const char *bcolon = strrchr(backend_addr, ':');
                 size_t bhlen = bcolon ? (size_t)(bcolon - backend_addr) : strlen(backend_addr);
                 if (bhlen >= sizeof(creds.backend_host)) bhlen = sizeof(creds.backend_host) - 1;
-                memcpy(creds.backend_host, backend_addr, bhlen);
-                creds.backend_host[bhlen] = '\0';
+                char host_only[256];
+                memcpy(host_only, backend_addr, bhlen);
+                host_only[bhlen] = '\0';
+                if (strcmp(host_only, "api.todofor.ai") != 0) {
+                    memcpy(creds.backend_host, host_only, bhlen + 1);
+                }
             }
 
             if (login_save_credentials(&creds) < 0) {
