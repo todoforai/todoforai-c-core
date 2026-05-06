@@ -17,8 +17,9 @@
 // enroll, browser, sandbox all default to this when nothing else is set.
 // Per-protocol ports are derived from the host (4100 Noise / 80 HTTP for
 // prod; 14100 / 4000 for localhost dev).
-#define LOGIN_DEFAULT_BACKEND_HOST "api.todofor.ai"
-#define LOGIN_DEFAULT_NOISE_PORT   "4100"
+#define LOGIN_DEFAULT_BACKEND_HOST   "api.todofor.ai"
+#define LOGIN_DEFAULT_NOISE_PORT     "4100"
+#define LOGIN_DEFAULT_BACKEND_PUBKEY "88e38a377ee697b448ec2779b625049110e05f77587a135df45994062b6bb76a"
 
 // Credential store — loaded from / saved to ~/.config/todoforai/credentials.json
 typedef struct {
