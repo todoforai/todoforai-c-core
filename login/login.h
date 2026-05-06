@@ -257,33 +257,11 @@ static void json_write_field(FILE *f, const char *key, const char *val, int *fir
     *first = 0;
 }
 
-int login_save_credentials(const login_credentials_t *creds) {
-    // Merge: load existing, overwrite only non-empty fields from new creds
-    login_credentials_t merged;
-    if (login_load_credentials(&merged) < 0)
-        memset(&merged, 0, sizeof(merged));
-    if (creds->api_key[0])
-        snprintf(merged.api_key, sizeof(merged.api_key), "%s", creds->api_key);
-    if (creds->device_id[0])
-        snprintf(merged.device_id, sizeof(merged.device_id), "%s", creds->device_id);
-    if (creds->device_secret[0])
-        snprintf(merged.device_secret, sizeof(merged.device_secret), "%s", creds->device_secret);
-    if (creds->device_name[0])
-        snprintf(merged.device_name, sizeof(merged.device_name), "%s", creds->device_name);
-    if (creds->user_id[0])
-        snprintf(merged.user_id, sizeof(merged.user_id), "%s", creds->user_id);
-    if (creds->user_email[0])
-        snprintf(merged.user_email, sizeof(merged.user_email), "%s", creds->user_email);
-    if (creds->user_name[0])
-        snprintf(merged.user_name, sizeof(merged.user_name), "%s", creds->user_name);
-    if (creds->backend_host[0])
-        snprintf(merged.backend_host, sizeof(merged.backend_host), "%s", creds->backend_host);
-
+// Atomically write the full credentials struct to disk (no merge).
+static int login_write_credentials_file(const login_credentials_t *c) {
     char path[1024];
     if (login_config_path(path, sizeof(path)) < 0) return -1;
     login_ensure_dir(path);
-
-    // Write to temp file, then rename for atomicity
     char tmp_path[1040];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
     FILE *f = fopen(tmp_path, "w");
@@ -293,18 +271,34 @@ int login_save_credentials(const login_credentials_t *creds) {
 #endif
     int first = 1;
     fputs("{\n", f);
-    json_write_field(f, "apiKey", merged.api_key, &first);
-    json_write_field(f, "deviceId", merged.device_id, &first);
-    json_write_field(f, "deviceSecret", merged.device_secret, &first);
-    json_write_field(f, "deviceName", merged.device_name, &first);
-    json_write_field(f, "userId", merged.user_id, &first);
-    json_write_field(f, "userEmail", merged.user_email, &first);
-    json_write_field(f, "userName", merged.user_name, &first);
-    json_write_field(f, "backendHost", merged.backend_host, &first);
+    json_write_field(f, "apiKey",       c->api_key,       &first);
+    json_write_field(f, "deviceId",     c->device_id,     &first);
+    json_write_field(f, "deviceSecret", c->device_secret, &first);
+    json_write_field(f, "deviceName",   c->device_name,   &first);
+    json_write_field(f, "userId",       c->user_id,       &first);
+    json_write_field(f, "userEmail",    c->user_email,    &first);
+    json_write_field(f, "userName",     c->user_name,     &first);
+    json_write_field(f, "backendHost",  c->backend_host,  &first);
     fputs("\n}\n", f);
     fclose(f);
     if (rename(tmp_path, path) != 0) { remove(tmp_path); return -1; }
     return 0;
+}
+
+int login_save_credentials(const login_credentials_t *creds) {
+    // Merge: load existing, overwrite only non-empty fields from new creds
+    login_credentials_t merged;
+    if (login_load_credentials(&merged) < 0)
+        memset(&merged, 0, sizeof(merged));
+    if (creds->api_key[0])      snprintf(merged.api_key,       sizeof(merged.api_key),       "%s", creds->api_key);
+    if (creds->device_id[0])    snprintf(merged.device_id,     sizeof(merged.device_id),     "%s", creds->device_id);
+    if (creds->device_secret[0])snprintf(merged.device_secret, sizeof(merged.device_secret), "%s", creds->device_secret);
+    if (creds->device_name[0])  snprintf(merged.device_name,   sizeof(merged.device_name),   "%s", creds->device_name);
+    if (creds->user_id[0])      snprintf(merged.user_id,       sizeof(merged.user_id),       "%s", creds->user_id);
+    if (creds->user_email[0])   snprintf(merged.user_email,    sizeof(merged.user_email),    "%s", creds->user_email);
+    if (creds->user_name[0])    snprintf(merged.user_name,     sizeof(merged.user_name),     "%s", creds->user_name);
+    if (creds->backend_host[0]) snprintf(merged.backend_host,  sizeof(merged.backend_host),  "%s", creds->backend_host);
+    return login_write_credentials_file(&merged);
 }
 
 // Set or clear backend_host without merge ambiguity. Empty/NULL clears it.
@@ -315,31 +309,7 @@ int login_set_backend_host(const char *host) {
         snprintf(creds.backend_host, sizeof(creds.backend_host), "%s", host);
     else
         creds.backend_host[0] = '\0';
-    // Re-write the file directly (bypass merge, which would re-fill from disk).
-    char path[1024];
-    if (login_config_path(path, sizeof(path)) < 0) return -1;
-    login_ensure_dir(path);
-    char tmp_path[1040];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
-    FILE *f = fopen(tmp_path, "w");
-    if (!f) return -1;
-#ifndef _WIN32
-    chmod(tmp_path, 0600);
-#endif
-    int first = 1;
-    fputs("{\n", f);
-    json_write_field(f, "apiKey", creds.api_key, &first);
-    json_write_field(f, "deviceId", creds.device_id, &first);
-    json_write_field(f, "deviceSecret", creds.device_secret, &first);
-    json_write_field(f, "deviceName", creds.device_name, &first);
-    json_write_field(f, "userId", creds.user_id, &first);
-    json_write_field(f, "userEmail", creds.user_email, &first);
-    json_write_field(f, "userName", creds.user_name, &first);
-    json_write_field(f, "backendHost", creds.backend_host, &first);
-    fputs("\n}\n", f);
-    fclose(f);
-    if (rename(tmp_path, path) != 0) { remove(tmp_path); return -1; }
-    return 0;
+    return login_write_credentials_file(&creds);
 }
 
 // ── whoami ────────────────────────────────────────────────────────────────────
