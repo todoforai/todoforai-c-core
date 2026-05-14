@@ -19,7 +19,6 @@
 // prod; 14100 / 4000 for localhost dev).
 #define LOGIN_DEFAULT_BACKEND_HOST   "api.todofor.ai"
 #define LOGIN_DEFAULT_NOISE_PORT     "4100"
-#define LOGIN_DEFAULT_BACKEND_PUBKEY "88e38a377ee697b448ec2779b625049110e05f77587a135df45994062b6bb76a"
 
 // Credential store — loaded from / saved to ~/.config/todoforai/credentials.json
 typedef struct {
@@ -33,10 +32,11 @@ typedef struct {
     char user_id[64];
     char user_email[256];
     char user_name[128];
-    // Backend host the credentials were minted against (e.g. "api.todofor.ai"
-    // or "127.0.0.1"). Lets the daemon connect to the same backend without
-    // re-passing --host. Port is derived per-protocol (host-based default).
-    char backend_host[256];
+    // Backend the credentials were minted against. Learned during `login`
+    // (TOFU on the Noise_NX handshake) and pinned thereafter — daemons read
+    // these to reconnect without any flags.
+    char backend_host[256];      // e.g. "api.todofor.ai" or "127.0.0.1"
+    char backend_pubkey[65];     // 32-byte Noise static pubkey, hex+NUL
 } login_credentials_t;
 
 // Load credentials from config file. Returns 0 on success, -1 if not found.
@@ -45,21 +45,18 @@ int login_load_credentials(login_credentials_t *creds);
 // Save credentials to config file. Returns 0 on success, -1 on error.
 int login_save_credentials(const login_credentials_t *creds);
 
-// Set or clear the persisted backend host (loads existing creds, overwrites
-// just backend_host, saves). Pass NULL or "" to clear.
-int login_set_backend_host(const char *host);
-
 // Get config file path. Writes to buf, returns 0 on success.
 int login_config_path(char *buf, size_t cap);
 
 // Run the full device login flow over Noise.
 //   backend_addr: "host:port" of backend Noise server
-//   backend_pub:  32-byte hex public key of backend Noise server
 //   client_name:  e.g. "sandbox", "browser", or "bridge" (bridge mints a
 //                 Device credential; others mint an ApiKey)
 //   device_name:  optional label for the new device (bridge only, may be NULL)
-// On success, saves credentials and returns 0.
-int login_device_flow(const char *backend_addr, const char *backend_pub,
+// The backend's Noise static pubkey is learned during the NX handshake (TOFU)
+// and persisted with the credentials. On success, saves credentials and
+// returns 0.
+int login_device_flow(const char *backend_addr,
                       const char *client_name, const char *device_name);
 
 // Print "whoami" output to stdout in a unified format. Reads creds from disk.
@@ -210,7 +207,8 @@ int login_load_credentials(login_credentials_t *creds) {
     json_find_string(buf, "userId", creds->user_id, sizeof(creds->user_id));
     json_find_string(buf, "userEmail", creds->user_email, sizeof(creds->user_email));
     json_find_string(buf, "userName", creds->user_name, sizeof(creds->user_name));
-    json_find_string(buf, "backendHost", creds->backend_host, sizeof(creds->backend_host));
+    json_find_string(buf, "backendHost",   creds->backend_host,   sizeof(creds->backend_host));
+    json_find_string(buf, "backendPubkey", creds->backend_pubkey, sizeof(creds->backend_pubkey));
     // Success if we loaded any credential type.
     return (creds->api_key[0] || creds->device_id[0]) ? 0 : -1;
 }
@@ -286,7 +284,8 @@ static int login_write_credentials_file(const login_credentials_t *c) {
     json_write_field(f, "userId",       c->user_id,       &first);
     json_write_field(f, "userEmail",    c->user_email,    &first);
     json_write_field(f, "userName",     c->user_name,     &first);
-    json_write_field(f, "backendHost",  c->backend_host,  &first);
+    json_write_field(f, "backendHost",   c->backend_host,   &first);
+    json_write_field(f, "backendPubkey", c->backend_pubkey, &first);
     fputs("\n}\n", f);
     fclose(f);
     if (rename(tmp_path, path) != 0) { remove(tmp_path); return -1; }
@@ -305,19 +304,9 @@ int login_save_credentials(const login_credentials_t *creds) {
     if (creds->user_id[0])      snprintf(merged.user_id,       sizeof(merged.user_id),       "%s", creds->user_id);
     if (creds->user_email[0])   snprintf(merged.user_email,    sizeof(merged.user_email),    "%s", creds->user_email);
     if (creds->user_name[0])    snprintf(merged.user_name,     sizeof(merged.user_name),     "%s", creds->user_name);
-    if (creds->backend_host[0]) snprintf(merged.backend_host,  sizeof(merged.backend_host),  "%s", creds->backend_host);
+    if (creds->backend_host[0])   snprintf(merged.backend_host,   sizeof(merged.backend_host),   "%s", creds->backend_host);
+    if (creds->backend_pubkey[0]) snprintf(merged.backend_pubkey, sizeof(merged.backend_pubkey), "%s", creds->backend_pubkey);
     return login_write_credentials_file(&merged);
-}
-
-// Set or clear backend_host without merge ambiguity. Empty/NULL clears it.
-int login_set_backend_host(const char *host) {
-    login_credentials_t creds;
-    if (login_load_credentials(&creds) < 0) memset(&creds, 0, sizeof(creds));
-    if (host && host[0])
-        snprintf(creds.backend_host, sizeof(creds.backend_host), "%s", host);
-    else
-        creds.backend_host[0] = '\0';
-    return login_write_credentials_file(&creds);
 }
 
 // ── whoami ────────────────────────────────────────────────────────────────────
@@ -490,10 +479,14 @@ typedef struct {
 // Return codes:
 //    0 — success
 //   -1 — TCP connect failed (DNS, refused, host unreachable)
-//   -2 — Noise handshake failed (wrong --server-pubkey, server identity changed,
-//        or remote isn't a Noise endpoint at all — e.g. plain HTTP on the wrong port)
+//   -2 — Noise handshake failed (server identity changed, or remote isn't a
+//        Noise endpoint at all — e.g. plain HTTP on the wrong port)
+//
+// remote_pub != NULL: pin (normal reconnect after login).
+// remote_pub == NULL: learn-mode TOFU; on success the server's static pubkey
+//   is written to `learned_pub` if non-NULL.
 static int login_noise_connect(login_session_t *s, const char *host, const char *port_str,
-                               const uint8_t remote_pub[32]) {
+                               const uint8_t *remote_pub, uint8_t learned_pub[32]) {
     s->fd = login_tcp_connect(host, port_str);
     if (s->fd == SOCK_INVALID) return -1;
 
@@ -515,20 +508,15 @@ static int login_noise_connect(login_session_t *s, const char *host, const char 
     free(m2_data);
 
     if (noise_handshake_split(&hs, &s->transport) < 0) { login_sock_close(s->fd); s->fd = SOCK_INVALID; return -2; }
+    if (learned_pub) memcpy(learned_pub, hs.rs, 32);
     return 0;
 }
 
 // ── Device login flow ─────────────────────────────────────────────────────────
 
-int login_device_flow(const char *backend_addr, const char *backend_pub,
+int login_device_flow(const char *backend_addr,
                       const char *client_name, const char *device_name) {
     login_sock_init();
-
-    uint8_t remote_pub[32];
-    if (login_hex_decode(remote_pub, 32, backend_pub) < 0) {
-        fprintf(stderr, "error: invalid backend public key\n");
-        return -1;
-    }
 
     char host[256], port_str[16];
     const char *colon = strrchr(backend_addr, ':');
@@ -539,9 +527,12 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
     host[hlen] = '\0';
     snprintf(port_str, sizeof(port_str), "%s", colon + 1);
 
-    // Connect + handshake
+    // Connect + handshake. TOFU: learn the backend's Noise static pubkey on
+    // the first handshake and persist it with the credentials so all later
+    // connections (daemon, enroll mint) pin against it.
     login_session_t session;
-    int conn_rc = login_noise_connect(&session, host, port_str, remote_pub);
+    uint8_t learned_pub[32];
+    int conn_rc = login_noise_connect(&session, host, port_str, NULL, learned_pub);
     if (conn_rc == -1) {
         fprintf(stderr,
             "error: cannot reach %s (TCP connect failed).\n"
@@ -553,11 +544,8 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
     if (conn_rc < 0) {
         fprintf(stderr,
             "error: connected to %s but Noise handshake failed.\n"
-            "  - Wrong --server-pubkey for this server (most common cause).\n"
-            "  - Server identity changed — check backend logs for\n"
-            "    '[noise] Server public key: <hex>' and pass it via\n"
-            "    --server-pubkey <hex> (or NOISE_BACKEND_PUBLIC_KEY).\n"
-            "  - --port should be the Noise-TCP RPC port (14100 dev, 4100 prod),\n"
+            "  - Remote isn't a Noise endpoint, or the port is wrong:\n"
+            "    --port must be the Noise-TCP RPC port (14100 dev, 4100 prod),\n"
             "    NOT the HTTP/WS bridge port (4000 dev, 80/443 prod).\n",
             backend_addr);
         return -1;
@@ -637,10 +625,11 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
         uint8_t *poll_resp;
         int poll_resp_len = login_noise_rpc(session.fd, &session.transport, poll_req, strlen(poll_req), &poll_resp);
         if (poll_resp_len < 0) {
-            // Connection lost — try to reconnect
+            // Connection lost — reconnect, pinning the key we learned on the
+            // first handshake so a MITM can't slip in mid-flow.
             login_sock_close(session.fd);
             fprintf(stderr, "Reconnecting...\n");
-            if (login_noise_connect(&session, host, port_str, remote_pub) < 0) {
+            if (login_noise_connect(&session, host, port_str, learned_pub, NULL) < 0) {
                 fprintf(stderr, "error: reconnect failed\n");
                 return -1;
             }
@@ -694,22 +683,14 @@ int login_device_flow(const char *backend_addr, const char *backend_pub,
                 break;
             }
 
+            // Persist backend host + learned pubkey so daemons can reconnect
+            // with zero flags. Same field for prod and dev — no special case.
+            snprintf(creds.backend_host, sizeof(creds.backend_host), "%s", host);
+            login_hex_encode(creds.backend_pubkey, learned_pub, 32);
+
             if (login_save_credentials(&creds) < 0) {
                 fprintf(stderr, "error: failed to save credentials\n");
                 break;
-            }
-
-            // Persist backend host so daemons can default to it. Empty/prod
-            // clears any stale dev host from previous logins.
-            {
-                const char *bcolon = strrchr(backend_addr, ':');
-                size_t bhlen = bcolon ? (size_t)(bcolon - backend_addr) : strlen(backend_addr);
-                if (bhlen >= sizeof(creds.backend_host)) bhlen = sizeof(creds.backend_host) - 1;
-                char host_only[256];
-                memcpy(host_only, backend_addr, bhlen);
-                host_only[bhlen] = '\0';
-                const char *to_save = strcmp(host_only, LOGIN_DEFAULT_BACKEND_HOST) == 0 ? NULL : host_only;
-                login_set_backend_host(to_save);
             }
 
             char config_path[1024];

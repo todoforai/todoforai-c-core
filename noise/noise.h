@@ -35,16 +35,21 @@ typedef struct {
 
 typedef struct {
     noise_symmetric_state_t symmetric;
-    uint8_t          rs[32];     // remote static public
+    uint8_t          rs[32];     // remote static public (pinned or learned)
+    int              rs_pinned;  // 1: verify rs on msg2; 0: learn it (TOFU)
     noise_keypair_t  e;          // local ephemeral
     uint8_t          re[32];     // remote ephemeral public
     int              message_index;
     int              complete;
 } noise_handshake_t;
 
-// Initialize NX handshake as initiator (client is anonymous, responder is pinned)
+// Initialize NX handshake as initiator.
+// remote_static_pub != NULL: pin and verify on msg2 (normal connect).
+// remote_static_pub == NULL: learn responder's static key on msg2 (TOFU,
+//   used during credential acquisition). Caller reads it from `hs->rs`
+//   after a successful `noise_handshake_read`.
 int noise_handshake_init(noise_handshake_t *hs,
-                         const uint8_t remote_static_pub[32]);
+                         const uint8_t *remote_static_pub);
 
 // Write handshake message, returns bytes written to out, or -1 on error
 int noise_handshake_write(noise_handshake_t *hs,

@@ -257,9 +257,12 @@ void noise_keypair_from_secret(noise_keypair_t *kp, const uint8_t secret[32]) {
 }
 
 int noise_handshake_init(noise_handshake_t *hs,
-                         const uint8_t remote_static_pub[32]) {
+                         const uint8_t *remote_static_pub) {
     memset(hs, 0, sizeof(*hs));
-    memcpy(hs->rs, remote_static_pub, 32);
+    if (remote_static_pub) {
+        memcpy(hs->rs, remote_static_pub, 32);
+        hs->rs_pinned = 1;
+    }
     symmetric_init(&hs->symmetric);
     // MixHash(prologue) — Noise spec requires this after initializing the symmetric state.
     // We don't support non-empty prologues, but MixHash([]) still updates h.
@@ -327,7 +330,13 @@ int noise_handshake_read(noise_handshake_t *hs,
     dbg("expected_rs", hs->rs, 32);
     if (s_len != 32) return -1;
     off += 48;
-    if (crypto_verify32(remote_static, hs->rs) != 0) return -1;
+    if (hs->rs_pinned) {
+        if (crypto_verify32(remote_static, hs->rs) != 0) return -1;
+    } else {
+        // TOFU: record the server's static key for the caller to persist.
+        memcpy(hs->rs, remote_static, 32);
+        hs->rs_pinned = 1;
+    }
 
     if (noise_dh(dh_result, hs->e.secret_key, remote_static) < 0) return -1;
     symmetric_mix_key(&hs->symmetric, dh_result, 32);
