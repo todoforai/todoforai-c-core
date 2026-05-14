@@ -10,6 +10,8 @@
 #define LOGIN_H
 
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define LOGIN_CONFIG_MAX 4096
 
@@ -19,6 +21,22 @@
 // prod; 14100 / 4000 for localhost dev).
 #define LOGIN_DEFAULT_BACKEND_HOST   "api.todofor.ai"
 #define LOGIN_DEFAULT_NOISE_PORT     "4100"
+#define LOGIN_DEV_NOISE_PORT         "14100"
+
+// True if host is a local/dev address (loopback or RFC1918 private range).
+// Used by CLIs to pick dev-port defaults when the host looks local.
+static inline int login_is_local_host(const char *h) {
+    if (!h) return 0;
+    if (!strcmp(h, "localhost") || !strcmp(h, "::1") || !strcmp(h, "[::1]")) return 1;
+    if (!strncmp(h, "127.", 4))     return 1;          // 127.0.0.0/8
+    if (!strncmp(h, "10.", 3))      return 1;          // 10.0.0.0/8
+    if (!strncmp(h, "192.168.", 8)) return 1;          // 192.168.0.0/16
+    if (!strncmp(h, "172.", 4)) {                      // 172.16.0.0/12
+        int o2 = atoi(h + 4);
+        if (o2 >= 16 && o2 <= 31) return 1;
+    }
+    return 0;
+}
 
 // Credential store — loaded from / saved to ~/.config/todoforai/credentials.json
 typedef struct {
@@ -37,6 +55,11 @@ typedef struct {
     // these to reconnect without any flags.
     char backend_host[256];      // e.g. "api.todofor.ai" or "127.0.0.1"
     char backend_pubkey[65];     // 32-byte Noise static pubkey, hex+NUL
+    // browser-manager (separate Noise endpoint). TOFU'd by `browser` CLI on
+    // first RPC after login, pinned thereafter. Empty for clients that never
+    // talk to browser-manager.
+    char browser_host[256];      // e.g. "browser.todofor.ai"
+    char browser_pubkey[65];     // 32-byte Noise static pubkey, hex+NUL
 } login_credentials_t;
 
 // Load credentials from config file. Returns 0 on success, -1 if not found.
@@ -65,11 +88,32 @@ int login_device_flow(const char *backend_addr,
 // Returns 0 if logged in, 1 if not.
 int login_print_whoami(const char *client_name);
 
+// Remove the credentials file. Returns 0 on success (or if no file existed),
+// 1 on error. Prints status to stderr.
+int login_logout(const char *client_name);
+
+// One-shot encrypted JSON RPC over Noise NX. Connect → handshake → send →
+// recv → close, in one call. Used by `bridge enroll`, `browser <cmd>`, etc.
+//   backend_addr     "host:port" of Noise server
+//   pinned_pub_hex   32-byte hex server pubkey to pin, or NULL for TOFU
+//   req / req_len    request JSON
+//   resp_buf/cap     destination for NUL-terminated response (truncated to cap-1)
+//   learned_pub_hex  if non-NULL, must point at a 65-byte buffer; on success the
+//                    server's static pubkey (hex+NUL) is written here
+// Returns response length (>= 0) or -1 on error. Prints actionable diagnostics
+// to stderr on TCP / handshake failures.
+int login_oneshot_rpc(const char *backend_addr,
+                      const char *pinned_pub_hex,
+                      const char *req, size_t req_len,
+                      char *resp_buf, size_t resp_cap,
+                      char *learned_pub_hex);
+
 #endif // LOGIN_H
 
 
 #ifdef LOGIN_IMPLEMENTATION
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -209,6 +253,8 @@ int login_load_credentials(login_credentials_t *creds) {
     json_find_string(buf, "userName", creds->user_name, sizeof(creds->user_name));
     json_find_string(buf, "backendHost",   creds->backend_host,   sizeof(creds->backend_host));
     json_find_string(buf, "backendPubkey", creds->backend_pubkey, sizeof(creds->backend_pubkey));
+    json_find_string(buf, "browserHost",   creds->browser_host,   sizeof(creds->browser_host));
+    json_find_string(buf, "browserPubkey", creds->browser_pubkey, sizeof(creds->browser_pubkey));
     // Success if we loaded any credential type.
     return (creds->api_key[0] || creds->device_id[0]) ? 0 : -1;
 }
@@ -286,6 +332,8 @@ static int login_write_credentials_file(const login_credentials_t *c) {
     json_write_field(f, "userName",     c->user_name,     &first);
     json_write_field(f, "backendHost",   c->backend_host,   &first);
     json_write_field(f, "backendPubkey", c->backend_pubkey, &first);
+    json_write_field(f, "browserHost",   c->browser_host,   &first);
+    json_write_field(f, "browserPubkey", c->browser_pubkey, &first);
     fputs("\n}\n", f);
     fclose(f);
     if (rename(tmp_path, path) != 0) { remove(tmp_path); return -1; }
@@ -306,6 +354,8 @@ int login_save_credentials(const login_credentials_t *creds) {
     if (creds->user_name[0])    snprintf(merged.user_name,     sizeof(merged.user_name),     "%s", creds->user_name);
     if (creds->backend_host[0])   snprintf(merged.backend_host,   sizeof(merged.backend_host),   "%s", creds->backend_host);
     if (creds->backend_pubkey[0]) snprintf(merged.backend_pubkey, sizeof(merged.backend_pubkey), "%s", creds->backend_pubkey);
+    if (creds->browser_host[0])   snprintf(merged.browser_host,   sizeof(merged.browser_host),   "%s", creds->browser_host);
+    if (creds->browser_pubkey[0]) snprintf(merged.browser_pubkey, sizeof(merged.browser_pubkey), "%s", creds->browser_pubkey);
     return login_write_credentials_file(&merged);
 }
 
@@ -509,6 +559,90 @@ static int login_noise_connect(login_session_t *s, const char *host, const char 
 
     if (noise_handshake_split(&hs, &s->transport) < 0) { login_sock_close(s->fd); s->fd = SOCK_INVALID; return -2; }
     if (learned_pub) memcpy(learned_pub, hs.rs, 32);
+    return 0;
+}
+
+// ── One-shot RPC (used by enroll mint, browser commands, etc.) ────────────────
+
+int login_oneshot_rpc(const char *backend_addr,
+                      const char *pinned_pub_hex,
+                      const char *req, size_t req_len,
+                      char *resp_buf, size_t resp_cap,
+                      char *learned_pub_hex) {
+    login_sock_init();
+
+    uint8_t pinned[32];
+    const uint8_t *pin = NULL;
+    if (pinned_pub_hex) {
+        if (login_hex_decode(pinned, 32, pinned_pub_hex) < 0) {
+            fprintf(stderr, "error: stored pubkey is corrupt (re-run login)\n");
+            return -1;
+        }
+        pin = pinned;
+    }
+
+    char host[256], port_str[16];
+    const char *colon = strrchr(backend_addr, ':');
+    if (!colon) { fprintf(stderr, "error: invalid address (missing port): %s\n", backend_addr); return -1; }
+    size_t hlen = (size_t)(colon - backend_addr);
+    if (hlen >= sizeof(host)) { fprintf(stderr, "error: host too long\n"); return -1; }
+    memcpy(host, backend_addr, hlen);
+    host[hlen] = '\0';
+    snprintf(port_str, sizeof(port_str), "%s", colon + 1);
+
+    login_session_t session;
+    uint8_t learned[32];
+    int conn_rc = login_noise_connect(&session, host, port_str, pin,
+                                      learned_pub_hex ? learned : NULL);
+    if (conn_rc == -1) {
+        fprintf(stderr,
+            "error: cannot reach %s (TCP connect failed).\n"
+            "  - Is the server running and listening on this host:port?\n"
+            "  - Check firewall / network. Try: nc -zv %s %s\n",
+            backend_addr, host, port_str);
+        return -1;
+    }
+    if (conn_rc < 0) {
+        fprintf(stderr,
+            "error: connected to %s but Noise handshake failed.\n"
+            "  - Server identity changed since login — log in again.\n"
+            "  - Or the port isn't a Noise endpoint.\n",
+            backend_addr);
+        return -1;
+    }
+
+    if (learned_pub_hex) login_hex_encode(learned_pub_hex, learned, 32);
+
+    uint8_t *dec = NULL;
+    int dec_len = login_noise_rpc(session.fd, &session.transport, req, req_len, &dec);
+    login_sock_close(session.fd);
+    if (dec_len < 0) { if (dec) free(dec); return -1; }
+
+    size_t copy = (size_t)dec_len < resp_cap - 1 ? (size_t)dec_len : resp_cap - 1;
+    memcpy(resp_buf, dec, copy);
+    resp_buf[copy] = '\0';
+    free(dec);
+    return (int)copy;
+}
+
+// ── logout ────────────────────────────────────────────────────────────────────
+
+int login_logout(const char *client_name) {
+    (void)client_name;
+    char path[1024];
+    if (login_config_path(path, sizeof(path)) < 0) {
+        fprintf(stderr, "error: failed to resolve config path\n");
+        return 1;
+    }
+    if (remove(path) != 0) {
+        if (errno == ENOENT) {
+            fprintf(stderr, "Not logged in (no credentials at %s).\n", path);
+            return 0;
+        }
+        fprintf(stderr, "error: failed to remove %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    fprintf(stderr, "\033[32m\xe2\x9c\x85 Logged out. Removed %s\033[0m\n", path);
     return 0;
 }
 
