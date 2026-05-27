@@ -40,8 +40,11 @@ static inline int login_is_local_host(const char *h) {
 
 // Credential store — loaded from / saved to ~/.config/todoforai/credentials.json
 typedef struct {
-    char api_key[256];
-    // Device credentials (used by the C bridge; other clients leave these empty).
+    // Short-lived bearer (dst_…) — refreshed each bridge connection so CLIs
+    // invoked outside a bridge-spawned PTY can still authenticate. Carried
+    // as `apiToken` in credentials.json; exported as TODOFORAI_API_TOKEN.
+    char api_token[128];
+    // Device credentials — the bridge's own auth to backend over Noise.
     char device_id[128];
     char device_secret[128];
     char device_name[128];
@@ -244,7 +247,10 @@ int login_load_credentials(login_credentials_t *creds) {
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
     buf[n] = '\0';
-    json_find_string(buf, "apiKey", creds->api_key, sizeof(creds->api_key));
+    // Read canonical `apiToken`; fall back to legacy `apiKey` for older files.
+    json_find_string(buf, "apiToken", creds->api_token, sizeof(creds->api_token));
+    if (!creds->api_token[0])
+        json_find_string(buf, "apiKey", creds->api_token, sizeof(creds->api_token));
     json_find_string(buf, "deviceId", creds->device_id, sizeof(creds->device_id));
     json_find_string(buf, "deviceSecret", creds->device_secret, sizeof(creds->device_secret));
     json_find_string(buf, "deviceName", creds->device_name, sizeof(creds->device_name));
@@ -255,8 +261,7 @@ int login_load_credentials(login_credentials_t *creds) {
     json_find_string(buf, "backendPubkey", creds->backend_pubkey, sizeof(creds->backend_pubkey));
     json_find_string(buf, "browserHost",   creds->browser_host,   sizeof(creds->browser_host));
     json_find_string(buf, "browserPubkey", creds->browser_pubkey, sizeof(creds->browser_pubkey));
-    // Success if we loaded any credential type.
-    return (creds->api_key[0] || creds->device_id[0]) ? 0 : -1;
+    return creds->device_id[0] ? 0 : -1;
 }
 
 // Write a JSON-escaped string value to file
@@ -323,7 +328,7 @@ static int login_write_credentials_file(const login_credentials_t *c) {
 #endif
     int first = 1;
     fputs("{\n", f);
-    json_write_field(f, "apiKey",       c->api_key,       &first);
+    json_write_field(f, "apiToken",     c->api_token,     &first);
     json_write_field(f, "deviceId",     c->device_id,     &first);
     json_write_field(f, "deviceSecret", c->device_secret, &first);
     json_write_field(f, "deviceName",   c->device_name,   &first);
@@ -345,7 +350,7 @@ int login_save_credentials(const login_credentials_t *creds) {
     login_credentials_t merged;
     if (login_load_credentials(&merged) < 0)
         memset(&merged, 0, sizeof(merged));
-    if (creds->api_key[0])      snprintf(merged.api_key,       sizeof(merged.api_key),       "%s", creds->api_key);
+    if (creds->api_token[0])    snprintf(merged.api_token,     sizeof(merged.api_token),     "%s", creds->api_token);
     if (creds->device_id[0])    snprintf(merged.device_id,     sizeof(merged.device_id),     "%s", creds->device_id);
     if (creds->device_secret[0])snprintf(merged.device_secret, sizeof(merged.device_secret), "%s", creds->device_secret);
     if (creds->device_name[0])  snprintf(merged.device_name,   sizeof(merged.device_name),   "%s", creds->device_name);
@@ -365,9 +370,7 @@ int login_print_whoami(const char *client_name) {
     login_credentials_t creds;
     memset(&creds, 0, sizeof(creds));
     int loaded = login_load_credentials(&creds);
-    int has_device = creds.device_id[0] && creds.device_secret[0];
-    int has_apikey = creds.api_key[0] != '\0';
-    if (loaded < 0 || (!has_device && !has_apikey)) {
+    if (loaded < 0 || !creds.device_id[0] || !creds.device_secret[0]) {
         fprintf(stderr, "Not logged in. Run `%s login` first.\n",
                 client_name ? client_name : "cli");
         return 1;
@@ -381,13 +384,9 @@ int login_print_whoami(const char *client_name) {
     } else {
         printf("User:   (unknown — log in again to refresh identity)\n");
     }
-    if (has_device) {
-        printf("Device: %s (id: %s)\n",
-               creds.device_name[0] ? creds.device_name : "(unnamed)",
-               creds.device_id);
-    } else {
-        printf("Auth:   API key\n");
-    }
+    printf("Device: %s (id: %s)\n",
+           creds.device_name[0] ? creds.device_name : "(unnamed)",
+           creds.device_id);
     char path[1024];
     if (login_config_path(path, sizeof(path)) == 0) printf("Config: %s\n", path);
     return 0;
@@ -789,7 +788,6 @@ int login_device_flow(const char *backend_addr,
         if (strcmp(status, "complete") == 0) {
             login_credentials_t creds;
             memset(&creds, 0, sizeof(creds));
-            json_find_string(resp_str, "apiKey", creds.api_key, sizeof(creds.api_key));
             // Device credentials are nested under "device":{...} — scan to that
             // object so json_find_string doesn't collide with envelope fields.
             const char *dev = strstr(resp_str, "\"device\"");
@@ -812,8 +810,8 @@ int login_device_flow(const char *backend_addr,
                 }
             }
 
-            if (!creds.api_key[0] && !creds.device_id[0]) {
-                fprintf(stderr, "error: approved but no credentials in response\n");
+            if (!creds.device_id[0]) {
+                fprintf(stderr, "error: approved but no device credentials in response\n");
                 break;
             }
 

@@ -6,10 +6,9 @@
  *
  * Config file: ~/.config/todoforai/credentials.json
  *   {
- *     "apiKey": "tfa_...",
- *     "browserManagerNoiseAddr": "host:port",
- *     "browserManagerNoisePublicKey": "hex",
- *     "sandboxManagerNoiseAddr": "host:port",
- *     "sandboxManagerNoisePublicKey": "hex"
+ *     "deviceId": "dev_...",
+ *     "deviceSecret": "...",
+ *     "backendHost": "host:port",
+ *     "backendPubkey": "hex"
  *   }
  */
