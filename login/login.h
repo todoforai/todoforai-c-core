@@ -75,15 +75,20 @@ int login_save_credentials(const login_credentials_t *creds);
 int login_config_path(char *buf, size_t cap);
 
 // Run the full device login flow over Noise.
-//   backend_addr: "host:port" of backend Noise server
-//   client_name:  e.g. "sandbox", "browser", or "bridge" (bridge mints a
-//                 Device credential; others mint an ApiKey)
-//   device_name:  optional label for the new device (bridge only, may be NULL)
+//   backend_addr:  "host:port" of backend Noise server
+//   client_name:   e.g. "sandbox", "browser", or "bridge" (bridge mints a
+//                  Device credential; others mint an ApiKey)
+//   device_name:   optional label for the new device (bridge only, may be NULL)
+//   identity_json: optional pre-built JSON object (no surrounding whitespace)
+//                  describing the host — included in cli.login.init so the
+//                  backend can dedupe by stable host id (machine_id), mirroring
+//                  the enroll redeem path. May be NULL to omit.
 // The backend's Noise static pubkey is learned during the NX handshake (TOFU)
 // and persisted with the credentials. On success, saves credentials and
 // returns 0.
 int login_device_flow(const char *backend_addr,
-                      const char *client_name, const char *device_name);
+                      const char *client_name, const char *device_name,
+                      const char *identity_json);
 
 // Print "whoami" output to stdout in a unified format. Reads creds from disk.
 //   client_name: "bridge" / "browser" / "sandbox" — affects the not-logged-in
@@ -648,7 +653,8 @@ int login_logout(const char *client_name) {
 // ── Device login flow ─────────────────────────────────────────────────────────
 
 int login_device_flow(const char *backend_addr,
-                      const char *client_name, const char *device_name) {
+                      const char *client_name, const char *device_name,
+                      const char *identity_json) {
     login_sock_init();
 
     char host[256], port_str[16];
@@ -690,7 +696,10 @@ int login_device_flow(const char *backend_addr,
     char id_hex[9];
     login_hex_encode(id_hex, id_bytes, 4);
 
-    char init_req[512];
+    // Optional fields appended to the cli.login.init payload — keeps the
+    // wire shape identical to enroll redeem so the backend can dedupe by
+    // identity.machine_id on the same code path.
+    char name_field[300] = "";
     if (device_name && *device_name) {
         char name_esc[256];
         if (json_escape_buf(name_esc, sizeof(name_esc), device_name) != 0) {
@@ -698,13 +707,28 @@ int login_device_flow(const char *backend_addr,
             fprintf(stderr, "error: device name too long\n");
             return -1;
         }
-        snprintf(init_req, sizeof(init_req),
-            "{\"id\":\"%s\",\"type\":\"cli.login.init\",\"payload\":{\"clientName\":\"%s\",\"deviceName\":\"%s\"}}",
-            id_hex, client_name, name_esc);
-    } else {
-        snprintf(init_req, sizeof(init_req),
-            "{\"id\":\"%s\",\"type\":\"cli.login.init\",\"payload\":{\"clientName\":\"%s\"}}",
-            id_hex, client_name);
+        snprintf(name_field, sizeof(name_field), ",\"deviceName\":\"%s\"", name_esc);
+    }
+    char identity_field[1100] = "";
+    if (identity_json && *identity_json) {
+        int ifn = snprintf(identity_field, sizeof(identity_field),
+                           ",\"identity\":%s", identity_json);
+        if (ifn < 0 || (size_t)ifn >= sizeof(identity_field)) {
+            login_sock_close(session.fd);
+            fprintf(stderr, "error: identity payload too long\n");
+            return -1;
+        }
+    }
+
+    char init_req[2048];
+    int init_n = snprintf(init_req, sizeof(init_req),
+        "{\"id\":\"%s\",\"type\":\"cli.login.init\","
+        "\"payload\":{\"clientName\":\"%s\"%s%s}}",
+        id_hex, client_name, name_field, identity_field);
+    if (init_n < 0 || (size_t)init_n >= sizeof(init_req)) {
+        login_sock_close(session.fd);
+        fprintf(stderr, "error: init request too long\n");
+        return -1;
     }
 
     uint8_t *init_resp;
