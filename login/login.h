@@ -66,10 +66,20 @@ typedef struct {
 } login_credentials_t;
 
 // Load credentials from config file. Returns 0 on success, -1 if not found.
+// The default-named variants operate on the process-wide active profile
+// (`login_set_profile`); the `_for` variants take an explicit profile name
+// (NULL or "default" = the flat top-level object, others live under `sets`).
 int login_load_credentials(login_credentials_t *creds);
+int login_load_credentials_for(const char *profile, login_credentials_t *creds);
 
 // Save credentials to config file. Returns 0 on success, -1 on error.
 int login_save_credentials(const login_credentials_t *creds);
+int login_save_credentials_for(const char *profile, const login_credentials_t *creds);
+
+// Select the active profile for subsequent load/save/login/logout calls.
+// Returns 0 on success, -1 if the profile name is invalid.
+int login_set_profile(const char *profile);
+const char *login_get_profile(void);
 
 // Get config file path. Writes to buf, returns 0 on success.
 int login_config_path(char *buf, size_t cap);
@@ -242,16 +252,137 @@ static const char *json_find_string(const char *json, const char *key, char *out
 
 // ── Credential I/O ────────────────────────────────────────────────────────────
 
-int login_load_credentials(login_credentials_t *creds) {
+// File layout: the `default` profile lives flat at the top level (unchanged,
+// backward-compatible). Extra profiles live under `"sets": { "<name>": {...} }`.
+// A name of NULL or "default" selects the flat top-level object.
+#define LOGIN_DEFAULT_PROFILE "default"
+#define LOGIN_MAX_PROFILES 16
+
+static int login_profile_is_default(const char *profile) {
+    return !profile || !profile[0] || strcmp(profile, LOGIN_DEFAULT_PROFILE) == 0;
+}
+
+// Process-wide active profile. `login_load_credentials`/`login_save_credentials`
+// (and the shared `login_device_flow`, which calls them internally) operate on
+// this profile. Defaults to "default" — set via `login_set_profile` before a
+// login/load to target a named profile without changing call signatures.
+static char g_login_profile[128] = LOGIN_DEFAULT_PROFILE;
+
+// Validate a profile name to a safe charset so it can be used verbatim as a
+// JSON object key (no escaping needed) and as a stable map key. Returns 1 if
+// valid. Empty → treated as the default profile by callers.
+static int login_profile_name_valid(const char *p) {
+    if (!p || !p[0]) return 1;                  // empty == default
+    size_t n = strlen(p);
+    if (n >= sizeof(((login_credentials_t *)0)->device_name)) return 0;
+    if (n >= 128) return 0;
+    for (const char *c = p; *c; c++)
+        if (!((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
+              (*c >= '0' && *c <= '9') || *c == '.' || *c == '_' || *c == '-'))
+            return 0;
+    return 1;
+}
+
+// Returns 0 on success, -1 if the name is invalid (caller decides how to fail).
+int login_set_profile(const char *profile) {
+    if (!login_profile_name_valid(profile)) {
+        fprintf(stderr, "error: invalid profile name '%s' (allowed: A-Z a-z 0-9 . _ -)\n",
+                profile ? profile : "");
+        return -1;
+    }
+    snprintf(g_login_profile, sizeof(g_login_profile), "%s",
+             profile && profile[0] ? profile : LOGIN_DEFAULT_PROFILE);
+    return 0;
+}
+
+const char *login_get_profile(void) { return g_login_profile; }
+
+// Skip a JSON string starting at the opening quote `*p == '"'`; returns the
+// pointer just past the closing quote (honoring backslash escapes).
+static const char *json_skip_string(const char *p) {
+    p++;  // opening quote
+    while (*p && *p != '"') { if (*p == '\\' && p[1]) p++; p++; }
+    return *p ? p + 1 : p;
+}
+
+// Advance from a `{` to the matching `}` (string-aware), returning the pointer
+// at the closing brace, or NULL if unbalanced.
+static const char *json_match_brace(const char *p) {
+    int depth = 0;
+    for (; *p; p++) {
+        if (*p == '"') { p = json_skip_string(p) - 1; continue; }
+        if (*p == '{') depth++;
+        else if (*p == '}' && --depth == 0) return p;
+    }
+    return NULL;
+}
+
+// Return a pointer to the value of the "sets" object member (its opening `{`),
+// or NULL if absent. String-aware so braces in field values don't confuse it.
+static const char *login_find_sets(const char *json) {
+    const char *p = strstr(json, "\"sets\"");
+    if (!p) return NULL;
+    p += 6;
+    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return *p == '{' ? p : NULL;
+}
+
+// Locate the sub-object for `profile` (a direct member of "sets") and copy its
+// raw JSON text (including braces) into `out`. Returns 0 on success, -1 if
+// absent. Scans only depth-1 keys of the sets object; string-aware.
+static int login_extract_profile_obj(const char *json, const char *profile,
+                                     char *out, size_t cap) {
+    const char *sets = login_find_sets(json);
+    if (!sets) return -1;
+    const char *end = json_match_brace(sets);
+    if (!end) return -1;
+    for (const char *p = sets + 1; p < end; ) {
+        while (p < end && (*p == ' ' || *p == ',' || *p == '\t' ||
+                           *p == '\n' || *p == '\r')) p++;
+        if (p >= end || *p != '"') break;
+        const char *kstart = p + 1;
+        const char *kend = json_skip_string(p) - 1;   // closing quote
+        size_t klen = (size_t)(kend - kstart);
+        p = kend + 1;
+        while (p < end && (*p == ' ' || *p == ':' || *p == '\t' ||
+                           *p == '\n' || *p == '\r')) p++;
+        if (p >= end || *p != '{') break;
+        const char *vend = json_match_brace(p);
+        if (!vend) break;
+        if (klen == strlen(profile) && strncmp(kstart, profile, klen) == 0) {
+            size_t len = (size_t)(vend - p + 1);
+            if (len + 1 > cap) return -1;
+            memcpy(out, p, len);
+            out[len] = '\0';
+            return 0;
+        }
+        p = vend + 1;
+    }
+    return -1;
+}
+
+int login_load_credentials_for(const char *profile, login_credentials_t *creds) {
     memset(creds, 0, sizeof(*creds));
     char path[1024];
     if (login_config_path(path, sizeof(path)) < 0) return -1;
     FILE *f = fopen(path, "r");
     if (!f) return -1;
-    char buf[LOGIN_CONFIG_MAX];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    char filebuf[LOGIN_CONFIG_MAX];
+    size_t n = fread(filebuf, 1, sizeof(filebuf) - 1, f);
     fclose(f);
-    buf[n] = '\0';
+    filebuf[n] = '\0';
+    // Default profile = flat top-level fields only; named profile = sets[name].
+    const char *buf = filebuf;
+    char obj[LOGIN_CONFIG_MAX];
+    if (login_profile_is_default(profile)) {
+        // Exclude the nested "sets" object so json_find_string can't pick up a
+        // named profile's fields when no flat default exists.
+        const char *sets = login_find_sets(filebuf);
+        if (sets) filebuf[sets - filebuf] = '\0';
+    } else {
+        if (login_extract_profile_obj(filebuf, profile, obj, sizeof(obj)) < 0) return -1;
+        buf = obj;
+    }
     // Read canonical `apiToken`; fall back to legacy `apiKey` for older files.
     json_find_string(buf, "apiToken", creds->api_token, sizeof(creds->api_token));
     if (!creds->api_token[0])
@@ -267,6 +398,10 @@ int login_load_credentials(login_credentials_t *creds) {
     json_find_string(buf, "browserHost",   creds->browser_host,   sizeof(creds->browser_host));
     json_find_string(buf, "browserPubkey", creds->browser_pubkey, sizeof(creds->browser_pubkey));
     return creds->device_id[0] ? 0 : -1;
+}
+
+int login_load_credentials(login_credentials_t *creds) {
+    return login_load_credentials_for(g_login_profile, creds);
 }
 
 // Write a JSON-escaped string value to file
@@ -311,18 +446,90 @@ static int json_escape_buf(char *out, size_t cap, const char *s) {
     return 0;
 }
 
-static void json_write_field(FILE *f, const char *key, const char *val, int *first) {
+static void json_write_field_indent(FILE *f, const char *indent, const char *key,
+                                     const char *val, int *first) {
     if (!val[0]) return;
     if (!*first) fputs(",\n", f);
-    fprintf(f, "  \"%s\": ", key);
+    fprintf(f, "%s\"%s\": ", indent, key);
     json_write_escaped(f, val);
     *first = 0;
 }
 
-// Atomically write the full credentials struct to disk (no merge).
-static int login_write_credentials_file(const login_credentials_t *c) {
+// Emit all credential fields (no surrounding braces) at the given indent.
+static void login_write_fields(FILE *f, const login_credentials_t *c,
+                               const char *indent, int *first) {
+    json_write_field_indent(f, indent, "apiToken",      c->api_token,      first);
+    json_write_field_indent(f, indent, "deviceId",      c->device_id,      first);
+    json_write_field_indent(f, indent, "deviceSecret",  c->device_secret,  first);
+    json_write_field_indent(f, indent, "deviceName",    c->device_name,    first);
+    json_write_field_indent(f, indent, "userId",        c->user_id,        first);
+    json_write_field_indent(f, indent, "userEmail",     c->user_email,     first);
+    json_write_field_indent(f, indent, "userName",      c->user_name,      first);
+    json_write_field_indent(f, indent, "backendHost",   c->backend_host,   first);
+    json_write_field_indent(f, indent, "backendPubkey", c->backend_pubkey, first);
+    json_write_field_indent(f, indent, "browserHost",   c->browser_host,   first);
+    json_write_field_indent(f, indent, "browserPubkey", c->browser_pubkey, first);
+}
+
+// Collect the names of all direct-member profiles under `"sets"` into `names`
+// (string-aware depth-1 key scan). Returns the count, or -1 if the file holds
+// more than `max` profiles (so callers can refuse to rewrite and truncate).
+static int login_list_profiles(const char *json, char names[][128], int max) {
+    const char *sets = login_find_sets(json);
+    if (!sets) return 0;
+    const char *end = json_match_brace(sets);
+    if (!end) return 0;
+    int count = 0;
+    for (const char *p = sets + 1; p < end; ) {
+        while (p < end && (*p == ' ' || *p == ',' || *p == '\t' ||
+                           *p == '\n' || *p == '\r')) p++;
+        if (p >= end || *p != '"') break;
+        const char *kstart = p + 1;
+        const char *kend = json_skip_string(p) - 1;   // closing quote
+        size_t klen = (size_t)(kend - kstart);
+        p = kend + 1;
+        while (p < end && (*p == ' ' || *p == ':' || *p == '\t' ||
+                           *p == '\n' || *p == '\r')) p++;
+        if (p >= end || *p != '{') break;
+        const char *vend = json_match_brace(p);
+        if (!vend) break;
+        if (count >= max) return -1;   // more profiles than caller can hold
+        if (klen < 128) {
+            memcpy(names[count], kstart, klen);
+            names[count][klen] = '\0';
+            count++;
+        }
+        p = vend + 1;
+    }
+    return count;
+}
+
+// Atomically write all profiles: `c` for `profile` (default flat at top level,
+// named under `sets`), preserving every other existing profile untouched.
+static int login_write_credentials_file_for(const char *profile,
+                                             const login_credentials_t *c) {
+    if (!login_profile_name_valid(profile)) return -1;
     char path[1024];
     if (login_config_path(path, sizeof(path)) < 0) return -1;
+
+    // Snapshot existing profiles so writing one never drops the others.
+    login_credentials_t def;
+    int have_def = login_load_credentials_for(LOGIN_DEFAULT_PROFILE, &def) == 0;
+    char names[LOGIN_MAX_PROFILES][128];
+    int ncount = 0;
+    {
+        FILE *rf = fopen(path, "r");
+        if (rf) {
+            char fb[LOGIN_CONFIG_MAX];
+            size_t rn = fread(fb, 1, sizeof(fb) - 1, rf);
+            fclose(rf);
+            fb[rn] = '\0';
+            ncount = login_list_profiles(fb, names, LOGIN_MAX_PROFILES);
+        }
+    }
+    int is_def = login_profile_is_default(profile);
+    if (is_def) { def = *c; have_def = 1; }
+
     login_ensure_dir(path);
     char tmp_path[1040];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
@@ -333,27 +540,65 @@ static int login_write_credentials_file(const login_credentials_t *c) {
 #endif
     int first = 1;
     fputs("{\n", f);
-    json_write_field(f, "apiToken",     c->api_token,     &first);
-    json_write_field(f, "deviceId",     c->device_id,     &first);
-    json_write_field(f, "deviceSecret", c->device_secret, &first);
-    json_write_field(f, "deviceName",   c->device_name,   &first);
-    json_write_field(f, "userId",       c->user_id,       &first);
-    json_write_field(f, "userEmail",    c->user_email,    &first);
-    json_write_field(f, "userName",     c->user_name,     &first);
-    json_write_field(f, "backendHost",   c->backend_host,   &first);
-    json_write_field(f, "backendPubkey", c->backend_pubkey, &first);
-    json_write_field(f, "browserHost",   c->browser_host,   &first);
-    json_write_field(f, "browserPubkey", c->browser_pubkey, &first);
+    if (have_def && def.device_id[0]) login_write_fields(f, &def, "  ", &first);
+
+    // Resolve the final list of named profiles to emit: existing ones (target
+    // swapped for `c`) plus the target if new, dropping any with empty
+    // device_id (this is how `logout --profile` removes a slot).
+    login_credentials_t sets_creds[LOGIN_MAX_PROFILES];
+    char sets_names[LOGIN_MAX_PROFILES][128];
+    int scount = 0;
+    int target_in_names = 0;
+    for (int i = 0; i < ncount && scount < LOGIN_MAX_PROFILES; i++) {
+        login_credentials_t pc;
+        if (!is_def && strcmp(names[i], profile) == 0) {
+            target_in_names = 1;
+            pc = *c;
+        } else if (login_load_credentials_for(names[i], &pc) < 0) {
+            continue;
+        }
+        if (!pc.device_id[0]) continue;
+        snprintf(sets_names[scount], sizeof(sets_names[scount]), "%s", names[i]);
+        sets_creds[scount++] = pc;
+    }
+    if (!is_def && !target_in_names && c->device_id[0]) {
+        if (scount >= LOGIN_MAX_PROFILES) {
+            fclose(f); remove(tmp_path);
+            fprintf(stderr, "error: too many profiles (max %d)\n", LOGIN_MAX_PROFILES);
+            return -1;
+        }
+        snprintf(sets_names[scount], sizeof(sets_names[scount]), "%s", profile);
+        sets_creds[scount++] = *c;
+    }
+
+    if (scount > 0) {
+        if (!first) fputs(",\n", f);
+        fputs("  \"sets\": {\n", f);
+        for (int i = 0; i < scount; i++) {
+            if (i) fputs(",\n", f);
+            fprintf(f, "    \"%s\": {\n", sets_names[i]);
+            int ffirst = 1;
+            login_write_fields(f, &sets_creds[i], "      ", &ffirst);
+            fputs("\n    }", f);
+        }
+        fputs("\n  }", f);
+        first = 0;
+    }
     fputs("\n}\n", f);
-    fclose(f);
+    int werr = ferror(f);
+    if (fclose(f) != 0 || werr) { remove(tmp_path); return -1; }
     if (rename(tmp_path, path) != 0) { remove(tmp_path); return -1; }
     return 0;
 }
 
-int login_save_credentials(const login_credentials_t *creds) {
-    // Merge: load existing, overwrite only non-empty fields from new creds
+static int login_write_credentials_file(const login_credentials_t *c) {
+    return login_write_credentials_file_for(LOGIN_DEFAULT_PROFILE, c);
+}
+
+int login_save_credentials_for(const char *profile, const login_credentials_t *creds) {
+    // Merge: load existing profile, overwrite only non-empty fields from new creds
     login_credentials_t merged;
-    if (login_load_credentials(&merged) < 0)
+    if (login_load_credentials_for(profile, &merged) < 0)
         memset(&merged, 0, sizeof(merged));
     if (creds->api_token[0])    snprintf(merged.api_token,     sizeof(merged.api_token),     "%s", creds->api_token);
     if (creds->device_id[0])    snprintf(merged.device_id,     sizeof(merged.device_id),     "%s", creds->device_id);
@@ -366,7 +611,11 @@ int login_save_credentials(const login_credentials_t *creds) {
     if (creds->backend_pubkey[0]) snprintf(merged.backend_pubkey, sizeof(merged.backend_pubkey), "%s", creds->backend_pubkey);
     if (creds->browser_host[0])   snprintf(merged.browser_host,   sizeof(merged.browser_host),   "%s", creds->browser_host);
     if (creds->browser_pubkey[0]) snprintf(merged.browser_pubkey, sizeof(merged.browser_pubkey), "%s", creds->browser_pubkey);
-    return login_write_credentials_file(&merged);
+    return login_write_credentials_file_for(profile, &merged);
+}
+
+int login_save_credentials(const login_credentials_t *creds) {
+    return login_save_credentials_for(g_login_profile, creds);
 }
 
 // ── whoami ────────────────────────────────────────────────────────────────────
@@ -638,15 +887,33 @@ int login_logout(const char *client_name) {
         fprintf(stderr, "error: failed to resolve config path\n");
         return 1;
     }
-    if (remove(path) != 0) {
-        if (errno == ENOENT) {
-            fprintf(stderr, "Not logged in (no credentials at %s).\n", path);
-            return 0;
-        }
-        fprintf(stderr, "error: failed to remove %s: %s\n", path, strerror(errno));
+    login_credentials_t exist;
+    if (login_load_credentials_for(g_login_profile, &exist) < 0) {
+        fprintf(stderr, "Not logged in (profile '%s').\n", g_login_profile);
+        return 0;
+    }
+    // Clear only the active profile's slot; other profiles in the file survive.
+    login_credentials_t empty;
+    memset(&empty, 0, sizeof(empty));
+    if (login_write_credentials_file_for(g_login_profile, &empty) < 0) {
+        fprintf(stderr, "error: failed to update %s\n", path);
         return 1;
     }
-    fprintf(stderr, "\033[32m\xe2\x9c\x85 Logged out. Removed %s\033[0m\n", path);
+    // If nothing remains (no default + no named profiles), drop the file.
+    login_credentials_t probe;
+    int has_default = login_load_credentials_for(LOGIN_DEFAULT_PROFILE, &probe) == 0
+                      && probe.device_id[0];
+    char fb[LOGIN_CONFIG_MAX]; fb[0] = '\0';
+    FILE *rf = fopen(path, "r");
+    if (rf) { size_t rn = fread(fb, 1, sizeof(fb) - 1, rf); fclose(rf); fb[rn] = '\0'; }
+    char nm[LOGIN_MAX_PROFILES][128];
+    int has_named = login_list_profiles(fb, nm, LOGIN_MAX_PROFILES) > 0;
+    if (!has_named && !has_default) remove(path);
+
+    if (login_profile_is_default(g_login_profile))
+        fprintf(stderr, "\033[32m\xe2\x9c\x85 Logged out. (%s)\033[0m\n", path);
+    else
+        fprintf(stderr, "\033[32m\xe2\x9c\x85 Logged out profile '%s'.\033[0m\n", g_login_profile);
     return 0;
 }
 
