@@ -160,6 +160,7 @@ static void login_sock_close(sock_t s) { closesocket(s); }
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/stat.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -706,6 +707,24 @@ static int login_read_frame(sock_t fd, uint8_t **out, size_t *out_len) {
     return 0;
 }
 
+// Bound every blocking send/recv on the socket so a server that accepts the
+// TCP connection but never drives the Noise handshake (or stalls mid-RPC)
+// fails fast instead of hanging the caller forever. Each login RPC is a single
+// request/response that returns within seconds; the device-login poll issues a
+// fresh RPC per iteration, so this bound is safe for that flow too.
+#define LOGIN_SOCK_TIMEOUT_SEC 10
+static void login_sock_set_timeout(sock_t fd) {
+#ifdef _WIN32
+    DWORD ms = LOGIN_SOCK_TIMEOUT_SEC * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ms, sizeof(ms));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&ms, sizeof(ms));
+#else
+    struct timeval tv = { LOGIN_SOCK_TIMEOUT_SEC, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
 static sock_t login_tcp_connect(const char *host, const char *port) {
     struct addrinfo hints, *res, *rp;
     memset(&hints, 0, sizeof(hints));
@@ -721,6 +740,7 @@ static sock_t login_tcp_connect(const char *host, const char *port) {
         fd = SOCK_INVALID;
     }
     freeaddrinfo(res);
+    if (fd != SOCK_INVALID) login_sock_set_timeout(fd);
     return fd;
 }
 
