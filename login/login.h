@@ -538,6 +538,31 @@ static void login_write_foreign_fields(FILE *f, const char *json, int *first) {
     }
 }
 
+// Return 1 if `json` has any top-level member this writer doesn't own —
+// used by logout to keep the file alive when foreign fields (URL-keyed API
+// keys, …) remain even though all C profiles are gone.
+static int login_has_foreign_fields(const char *json) {
+    const char *p = strchr(json, '{');
+    if (!p) return 0;
+    const char *end = json_match_brace(p);
+    if (!end) return 0;
+    for (p = p + 1; p < end; ) {
+        while (p < end && (*p == ' ' || *p == ',' || *p == '\t' ||
+                           *p == '\n' || *p == '\r')) p++;
+        if (p >= end || *p != '"') break;
+        const char *kstart = p + 1;
+        const char *kend = json_skip_string(p) - 1;
+        p = kend + 1;
+        while (p < end && (*p == ' ' || *p == ':' || *p == '\t' ||
+                           *p == '\n' || *p == '\r')) p++;
+        const char *vend = json_skip_value(p);
+        if (!vend || vend > end) break;
+        if (!login_key_is_known(kstart, (size_t)(kend - kstart))) return 1;
+        p = vend;
+    }
+    return 0;
+}
+
 // Collect the names of all direct-member profiles under `"sets"` into `names`
 // (string-aware depth-1 key scan). Returns the count, or -1 if the file holds
 // more than `max` profiles (so callers can refuse to rewrite and truncate).
@@ -593,7 +618,19 @@ static int login_write_credentials_file_for(const char *profile,
             size_t rn = fread(fb, 1, sizeof(fb) - 1, rf);
             fclose(rf);
             fb[rn] = '\0';
+            // A truncated snapshot would rewrite the file minus whatever fell
+            // past the buffer — refuse instead of silently losing data.
+            if (rn == sizeof(fb) - 1) {
+                fprintf(stderr, "error: %s exceeds %d bytes — refusing to rewrite\n",
+                        path, LOGIN_CONFIG_MAX);
+                return -1;
+            }
             ncount = login_list_profiles(fb, names, LOGIN_MAX_PROFILES);
+            // -1 = more profiles than we can hold; rewriting would drop them all.
+            if (ncount < 0) {
+                fprintf(stderr, "error: %s holds too many profiles — refusing to rewrite\n", path);
+                return -1;
+            }
         }
     }
     int is_def = login_profile_is_default(profile);
@@ -996,8 +1033,8 @@ int login_logout(const char *client_name) {
     FILE *rf = fopen(path, "r");
     if (rf) { size_t rn = fread(fb, 1, sizeof(fb) - 1, rf); fclose(rf); fb[rn] = '\0'; }
     char nm[LOGIN_MAX_PROFILES][128];
-    int has_named = login_list_profiles(fb, nm, LOGIN_MAX_PROFILES) > 0;
-    if (!has_named && !has_default) remove(path);
+    int has_named = login_list_profiles(fb, nm, LOGIN_MAX_PROFILES) != 0;
+    if (!has_named && !has_default && !login_has_foreign_fields(fb)) remove(path);
 
     if (login_profile_is_default(g_login_profile))
         fprintf(stderr, "\033[32m\xe2\x9c\x85 Logged out. (%s)\033[0m\n", path);
