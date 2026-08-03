@@ -472,6 +472,72 @@ static void login_write_fields(FILE *f, const login_credentials_t *c,
     json_write_field_indent(f, indent, "browserPubkey", c->browser_pubkey, first);
 }
 
+// Return 1 if `key` (klen bytes) is one of the members login_write_fields /
+// the profile writer emits itself — everything else is foreign (e.g. the
+// URL-keyed API keys the TS CLIs store: `"https://api.todofor.ai": "…"`) and
+// must be carried over verbatim on rewrite instead of being dropped.
+static int login_key_is_known(const char *key, size_t klen) {
+    static const char *known[] = {
+        "apiToken", "deviceId", "deviceSecret", "deviceName", "userId",
+        "userEmail", "userName", "backendHost", "backendPubkey",
+        "browserHost", "browserPubkey", "sets",
+    };
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++)
+        if (strlen(known[i]) == klen && memcmp(known[i], key, klen) == 0) return 1;
+    return 0;
+}
+
+// Advance past one JSON value (string / object / array / scalar), returning
+// the pointer just after it, or NULL on malformed input.
+static const char *json_skip_value(const char *p) {
+    if (*p == '"') return json_skip_string(p);
+    if (*p == '{') { const char *e = json_match_brace(p); return e ? e + 1 : NULL; }
+    if (*p == '[') {
+        int depth = 0;
+        for (; *p; p++) {
+            if (*p == '"') { p = json_skip_string(p) - 1; continue; }
+            if (*p == '[') depth++;
+            else if (*p == ']' && --depth == 0) return p + 1;
+        }
+        return NULL;
+    }
+    while (*p && *p != ',' && *p != '}' && *p != ']' &&
+           *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+    return p;
+}
+
+// Re-emit every top-level member of `json` that this writer doesn't own
+// (login_key_is_known) verbatim, so a rewrite never drops fields other
+// tools (TS shared-credentials: URL-keyed API keys, …) stored in the file.
+static void login_write_foreign_fields(FILE *f, const char *json, int *first) {
+    const char *p = strchr(json, '{');
+    if (!p) return;
+    const char *end = json_match_brace(p);
+    if (!end) return;
+    for (p = p + 1; p < end; ) {
+        while (p < end && (*p == ' ' || *p == ',' || *p == '\t' ||
+                           *p == '\n' || *p == '\r')) p++;
+        if (p >= end || *p != '"') break;
+        const char *kstart = p + 1;
+        const char *kend = json_skip_string(p) - 1;   // closing quote
+        p = kend + 1;
+        while (p < end && (*p == ' ' || *p == ':' || *p == '\t' ||
+                           *p == '\n' || *p == '\r')) p++;
+        const char *vstart = p;
+        const char *vend = json_skip_value(p);
+        if (!vend || vend > end) break;
+        if (!login_key_is_known(kstart, (size_t)(kend - kstart))) {
+            if (!*first) fputs(",\n", f);
+            fputs("  \"", f);
+            fwrite(kstart, 1, (size_t)(kend - kstart), f);
+            fputs("\": ", f);
+            fwrite(vstart, 1, (size_t)(vend - vstart), f);
+            *first = 0;
+        }
+        p = vend;
+    }
+}
+
 // Collect the names of all direct-member profiles under `"sets"` into `names`
 // (string-aware depth-1 key scan). Returns the count, or -1 if the file holds
 // more than `max` profiles (so callers can refuse to rewrite and truncate).
@@ -513,15 +579,17 @@ static int login_write_credentials_file_for(const char *profile,
     char path[1024];
     if (login_config_path(path, sizeof(path)) < 0) return -1;
 
-    // Snapshot existing profiles so writing one never drops the others.
+    // Snapshot existing profiles (and the raw file, for foreign-field
+    // carry-over) so writing one profile never drops anything else.
     login_credentials_t def;
     int have_def = login_load_credentials_for(LOGIN_DEFAULT_PROFILE, &def) == 0;
     char names[LOGIN_MAX_PROFILES][128];
     int ncount = 0;
+    char fb[LOGIN_CONFIG_MAX];
+    fb[0] = '\0';
     {
         FILE *rf = fopen(path, "r");
         if (rf) {
-            char fb[LOGIN_CONFIG_MAX];
             size_t rn = fread(fb, 1, sizeof(fb) - 1, rf);
             fclose(rf);
             fb[rn] = '\0';
@@ -542,6 +610,7 @@ static int login_write_credentials_file_for(const char *profile,
     int first = 1;
     fputs("{\n", f);
     if (have_def && def.device_id[0]) login_write_fields(f, &def, "  ", &first);
+    login_write_foreign_fields(f, fb, &first);
 
     // Resolve the final list of named profiles to emit: existing ones (target
     // swapped for `c`) plus the target if new, dropping any with empty
