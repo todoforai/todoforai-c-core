@@ -209,6 +209,17 @@ int login_config_path(char *buf, size_t cap) {
     return 0;
 }
 
+// Atomic replace. POSIX rename() overwrites; Win32 rename() fails with EEXIST/
+// EACCES when the target exists — MoveFileEx with REPLACE_EXISTING is the
+// overwriting equivalent.
+static int login_replace_file(const char *tmp_path, const char *path) {
+#ifdef _WIN32
+    return MoveFileExA(tmp_path, path, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
+#else
+    return rename(tmp_path, path);
+#endif
+}
+
 static void login_ensure_dir(const char *filepath) {
     char tmp[1024];
     snprintf(tmp, sizeof(tmp), "%s", filepath);
@@ -694,7 +705,7 @@ static int login_write_credentials_file_for(const char *profile,
     fputs("\n}\n", f);
     int werr = ferror(f);
     if (fclose(f) != 0 || werr) { remove(tmp_path); return -1; }
-    if (rename(tmp_path, path) != 0) { remove(tmp_path); return -1; }
+    if (login_replace_file(tmp_path, path) != 0) { remove(tmp_path); return -1; }
     return 0;
 }
 
@@ -1022,7 +1033,7 @@ int login_logout(const char *client_name) {
     login_credentials_t empty;
     memset(&empty, 0, sizeof(empty));
     if (login_write_credentials_file_for(g_login_profile, &empty) < 0) {
-        fprintf(stderr, "error: failed to update %s\n", path);
+        fprintf(stderr, "error: failed to update %s: %s\n", path, strerror(errno));
         return 1;
     }
     // If nothing remains (no default + no named profiles), drop the file.
